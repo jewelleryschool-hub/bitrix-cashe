@@ -193,7 +193,7 @@ app.get('/messages', async (req, res) => {
 
     // Загружаем сообщения для каждого чата (первые 200 чатов)
     const chatsWithMessages = [];
-    const chatsToProcess = chats.slice(0, 300);
+    const chatsToProcess = chats.slice(0, 500);
 
     for (let i = 0; i < chatsToProcess.length; i++) {
       const chat = chatsToProcess[i];
@@ -233,7 +233,7 @@ else sources['Other'] = (sources['Other'] || 0) + 1;
         entity_id: entityId,
         last_message: chat.message ? chat.message.text : '',
         messages_count: messages.length,
-        messages: messages.slice(0, 20) // первые 10 сообщений для анализа
+        messages: messages.slice(0, 50) // первые 10 сообщений для анализа
       });
 
       if (i % 20 === 0) console.log('Processed', i, 'of', chatsToProcess.length, 'chats');
