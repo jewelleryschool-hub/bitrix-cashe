@@ -217,9 +217,10 @@ app.get('/messages', async (req, res) => {
 
       // Источник
       const entityId = chat.chat ? chat.chat.entity_id : '';
-      if (entityId.includes('instagram')) sources['Instagram'] = (sources['Instagram'] || 0) + 1;
-      else if (entityId.includes('whatsapp')) sources['WhatsApp'] = (sources['WhatsApp'] || 0) + 1;
-      else sources['Other'] = (sources['Other'] || 0) + 1;
+      const entityIdStr = entityId || '';
+if (entityIdStr.includes('instagram')) sources['Instagram'] = (sources['Instagram'] || 0) + 1;
+else if (entityIdStr.includes('whatsapp')) sources['WhatsApp'] = (sources['WhatsApp'] || 0) + 1;
+else sources['Other'] = (sources['Other'] || 0) + 1;
 
       // Загружаем сообщения
       const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 100);
