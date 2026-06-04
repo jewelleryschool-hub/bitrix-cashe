@@ -193,7 +193,7 @@ app.get('/messages', async (req, res) => {
 
     // Загружаем сообщения для каждого чата (первые 200 чатов)
     const chatsWithMessages = [];
-    const chatsToProcess = chats.slice(0, 200);
+    const chatsToProcess = chats.slice(0, 300);
 
     for (let i = 0; i < chatsToProcess.length; i++) {
       const chat = chatsToProcess[i];
@@ -222,7 +222,7 @@ app.get('/messages', async (req, res) => {
       else sources['Other'] = (sources['Other'] || 0) + 1;
 
       // Загружаем сообщения
-      const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 50);
+      const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 100);
       
       chatsWithMessages.push({
         id: chatId,
@@ -232,7 +232,7 @@ app.get('/messages', async (req, res) => {
         entity_id: entityId,
         last_message: chat.message ? chat.message.text : '',
         messages_count: messages.length,
-        messages: messages.slice(0, 10) // первые 10 сообщений для анализа
+        messages: messages.slice(0, 20) // первые 10 сообщений для анализа
       });
 
       if (i % 20 === 0) console.log('Processed', i, 'of', chatsToProcess.length, 'chats');
