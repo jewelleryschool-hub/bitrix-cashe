@@ -11,6 +11,7 @@ app.use(express.json({ limit: '10mb' }));
 let cache = {};
 let lastUpdate = {};
 let loading = {};
+let lastMessageIds = {};
 
 async function fetchAll(method, dateFrom, dateTo, selectFields, webhook = WEBHOOK) {
   let results = [];
@@ -275,6 +276,23 @@ app.get('/health', (req, res) => {
     cacheKeys: Object.keys(cache), 
     loading: Object.keys(loading).filter(k => loading[k]) 
   });
+});
+
+// ============================================
+// LAST MESSAGE ID — антидубль для Romeo
+// ============================================
+app.get('/last-message-id', (req, res) => {
+  const chatId = req.query.chat_id;
+  if (!chatId) return res.status(400).json({ error: 'chat_id required' });
+  res.json({ chat_id: chatId, last_id: lastMessageIds[chatId] || 0 });
+});
+
+app.post('/last-message-id', (req, res) => {
+  const { chat_id, message_id } = req.body;
+  if (!chat_id || !message_id) return res.status(400).json({ error: 'chat_id and message_id required' });
+  lastMessageIds[chat_id] = message_id;
+  console.log('Last message ID saved:', chat_id, message_id);
+  res.json({ ok: true, chat_id, message_id });
 });
 
 // ============================================
