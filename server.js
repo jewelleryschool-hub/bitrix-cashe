@@ -199,6 +199,7 @@ app.get('/workday', async (req, res) => {
     const dateFrom = date + 'T00:00:00+03:00';
     const dateTo = date + 'T23:59:59+03:00';
 
+    // Задачи
     let tasks = [];
     let taskStart = 0;
     let hasMoreTasks = true;
@@ -214,8 +215,9 @@ app.get('/workday', async (req, res) => {
         if (d.result && d.result.tasks) {
           tasks = tasks.concat(d.result.tasks);
         }
-        if (d.next && d.next > taskStart && tasks.length < 200) {
-          taskStart = d.next;
+        const nextVal = d.next ? parseInt(d.next) : null;
+        if (nextVal && nextVal > taskStart && tasks.length < 200) {
+          taskStart = nextVal;
         } else {
           hasMoreTasks = false;
         }
@@ -223,6 +225,7 @@ app.get('/workday', async (req, res) => {
       await new Promise(r => setTimeout(r, 300));
     }
 
+    // Активности
     let activities = [];
     let actStart = 0;
     let hasMoreAct = true;
@@ -239,8 +242,9 @@ app.get('/workday', async (req, res) => {
         if (d.result && Array.isArray(d.result)) {
           activities = activities.concat(d.result);
         }
-        if (d.next && d.next > actStart) {
-          actStart = d.next;
+        const nextVal = d.next ? parseInt(d.next) : null;
+        if (nextVal && nextVal > actStart) {
+          actStart = nextVal;
         } else {
           hasMoreAct = false;
         }
@@ -248,6 +252,7 @@ app.get('/workday', async (req, res) => {
       await new Promise(r => setTimeout(r, 300));
     }
 
+    // Переписки за день из общего кэша
     const msgCache = cache['messages_kash_500'];
     let dayMessages = [];
     if (msgCache && msgCache.chats) {
@@ -267,15 +272,16 @@ app.get('/workday', async (req, res) => {
     }
 
     const tasksClosed = tasks.filter(t => t.closedDate && t.closedDate.substring(0,10) === date).length;
-    const tasksOverdue = tasks.filter(t => {
-      return t.status !== '5' && t.deadline && new Date(t.deadline) < new Date();
-    }).length;
+    const tasksOverdue = tasks.filter(t => t.status !== '5' && t.deadline && new Date(t.deadline) < new Date()).length;
     const tasksOpen = tasks.filter(t => t.status !== '5').length;
 
     const activityByHour = {};
     activities.forEach(a => {
-      const h = parseInt(a.created.substring(11, 13));
-      activityByHour[h] = (activityByHour[h] || 0) + 1;
+      const created = a.CREATED || a.created || '';
+      if (created.length > 13) {
+        const h = parseInt(created.substring(11, 13));
+        activityByHour[h] = (activityByHour[h] || 0) + 1;
+      }
     });
 
     const msgByHour = {};
@@ -285,7 +291,7 @@ app.get('/workday', async (req, res) => {
     });
 
     const allTimes = [
-      ...activities.map(a => a.created),
+      ...activities.map(a => a.CREATED || a.created),
       ...managerDayMsgs.map(m => m.date)
     ].filter(Boolean).sort();
     const firstActivity = allTimes[0] || null;
