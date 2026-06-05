@@ -6,6 +6,8 @@ const PORT = process.env.PORT || 3000;
 const WEBHOOK = 'https://b24-99blai.bitrix24.ru/rest/1/uop89s51t0hivx0p';
 const WEBHOOK_KASH = 'https://b24-99blai.bitrix24.ru/rest/20326/yyse913stg6uxm80';
 
+app.use(express.json({ limit: '10mb' }));
+
 let cache = {};
 let lastUpdate = {};
 let loading = {};
@@ -169,7 +171,7 @@ app.get('/messages', async (req, res) => {
   const cacheKey = 'messages_kash_' + limit;
   const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
 
-  if (cache[cacheKey] && cacheAge < 21600000) { // кэш 6 часов
+  if (cache[cacheKey] && cacheAge < 21600000) {
     console.log('Cache hit for messages');
     return res.json(cache[cacheKey]);
   }
@@ -182,16 +184,13 @@ app.get('/messages', async (req, res) => {
   console.log('Loading chats for Kashinskiy...');
 
   try {
-    // Загружаем список чатов
     const chats = await fetchChats(WEBHOOK_KASH, limit);
     console.log('Total chats:', chats.length);
 
-    // Статистика по месяцам
     const byMonth = {};
     const byStatus = { open: 0, closed: 0, inProgress: 0 };
     const sources = {};
 
-    // Загружаем сообщения для каждого чата (первые 200 чатов)
     const chatsWithMessages = [];
     const chatsToProcess = chats.slice(0, 500);
 
@@ -199,13 +198,11 @@ app.get('/messages', async (req, res) => {
       const chat = chatsToProcess[i];
       const chatId = chat.chat_id;
       
-      // Статус чата
       const status = chat.lines ? chat.lines.status : 0;
       if (status === 40) byStatus.closed++;
       else if (status === 20 || status === 25) byStatus.inProgress++;
       else byStatus.open++;
 
-      // По месяцам
       const dateStr = chat.chat && chat.chat.date_create ? chat.chat.date_create : (chat.message ? chat.message.date : null);
       if (dateStr) {
         const month = dateStr.substring(0, 7);
@@ -215,14 +212,12 @@ app.get('/messages', async (req, res) => {
         else byMonth[month].open++;
       }
 
-      // Источник
       const entityId = chat.chat ? chat.chat.entity_id : '';
       const entityIdStr = entityId || '';
-if (entityIdStr.includes('instagram')) sources['Instagram'] = (sources['Instagram'] || 0) + 1;
-else if (entityIdStr.includes('whatsapp')) sources['WhatsApp'] = (sources['WhatsApp'] || 0) + 1;
-else sources['Other'] = (sources['Other'] || 0) + 1;
+      if (entityIdStr.includes('instagram')) sources['Instagram'] = (sources['Instagram'] || 0) + 1;
+      else if (entityIdStr.includes('whatsapp')) sources['WhatsApp'] = (sources['WhatsApp'] || 0) + 1;
+      else sources['Other'] = (sources['Other'] || 0) + 1;
 
-      // Загружаем сообщения
       const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 100);
       
       chatsWithMessages.push({
@@ -233,7 +228,7 @@ else sources['Other'] = (sources['Other'] || 0) + 1;
         entity_id: entityId,
         last_message: chat.message ? chat.message.text : '',
         messages_count: messages.length,
-        messages: messages.slice(0, 50) // первые 10 сообщений для анализа
+        messages: messages.slice(0, 50)
       });
 
       if (i % 20 === 0) console.log('Processed', i, 'of', chatsToProcess.length, 'chats');
@@ -280,6 +275,35 @@ app.get('/health', (req, res) => {
     cacheKeys: Object.keys(cache), 
     loading: Object.keys(loading).filter(k => loading[k]) 
   });
+});
+
+// ============================================
+// CLAUDE API PROXY
+// ============================================
+app.post('/claude', async (req, res) => {
+  try {
+    const apiKey = req.headers['x-api-key'];
+    if (!apiKey) {
+      return res.status(400).json({ error: 'x-api-key header required' });
+    }
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify(req.body),
+      timeout: 60000
+    });
+
+    const data = await response.json();
+    res.status(response.status).json(data);
+  } catch (error) {
+    console.log('Claude proxy error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.listen(PORT, () => {
