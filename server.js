@@ -218,6 +218,76 @@ app.get('/leads-stats', async (req, res) => {
   }
 });
 
+// ============================================
+// LEADS DEBUG — диагностика внутриканального разделения (read-only)
+// Показывает реальные entity_id, id линий, типы и сырые примеры.
+// Нужен, чтобы увидеть подканалы и расшифровать Other/Unknown.
+// ============================================
+app.get('/leads-debug', async (req, res) => {
+  const limit = parseInt(req.query.limit || 500);
+  const webhookParam = req.query.webhook;
+  const webhook = webhookParam || WEBHOOK_KASH;
+  const cacheKey = 'leads_debug_' + (webhookParam ? webhookParam.slice(-12) : 'kash') + '_' + limit;
+  const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
+
+  if (cache[cacheKey] && cacheAge < 21600000) return res.json(cache[cacheKey]);
+  if (loading[cacheKey]) return res.json({ status: 'loading', message: 'Считаю, попробуйте через 1-2 минуты' });
+  loading[cacheKey] = true;
+
+  try {
+    const chats = await fetchChats(webhook, limit);
+
+    const byEntityType = {};
+    const byEntityId = {};
+    const byLineId = {};
+    const byEntityIdSource = {}; // полный entity_id -> к какому source его относит detectSource
+
+    for (const chat of chats) {
+      const c = chat.chat || {};
+      const lines = chat.lines || {};
+      const etype = c.entity_type || 'none';
+      byEntityType[etype] = (byEntityType[etype] || 0) + 1;
+
+      const eid = c.entity_id || '';
+      byEntityId[eid] = (byEntityId[eid] || 0) + 1;
+      if (!byEntityIdSource[eid]) byEntityIdSource[eid] = detectSource(eid);
+
+      // id линии: сначала из lines.id, иначе из частей entity_id (livechat|6|... -> 6)
+      const parts = eid.split('|');
+      const lineId = (lines.id !== undefined ? String(lines.id) : (parts[1] || 'unknown'));
+      byLineId[lineId] = (byLineId[lineId] || 0) + 1;
+    }
+
+    // топ реальных строк entity_id с тем, как detectSource их классифицирует
+    const topEntityIds = Object.keys(byEntityId)
+      .sort((a, b) => byEntityId[b] - byEntityId[a])
+      .slice(0, 40)
+      .map(eid => ({ entity_id: eid, count: byEntityId[eid], detected_as: byEntityIdSource[eid] }));
+
+    // сырые примеры целиком — чтобы видеть ВСЕ доступные поля chat + lines
+    const samples = chats.slice(0, 8).map(ch => ({ chat: ch.chat || null, lines: ch.lines || null }));
+
+    const result = {
+      total_chats: chats.length,
+      byEntityType,
+      byLineId,
+      distinct_entity_ids: Object.keys(byEntityId).length,
+      topEntityIds,
+      samples,
+      note: 'topEntityIds.detected_as показывает, как текущий detectSource классифицирует строку. byLineId = разбивка по id открытой линии (подканалы). samples = сырые объекты для просмотра всех полей.',
+      updatedAt: new Date().toISOString()
+    };
+
+    cache[cacheKey] = result;
+    lastUpdate[cacheKey] = Date.now();
+    loading[cacheKey] = false;
+    res.json(result);
+  } catch (error) {
+    loading[cacheKey] = false;
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/messages', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const cacheKey = 'messages_kash_' + limit;
