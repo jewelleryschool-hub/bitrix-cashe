@@ -429,11 +429,10 @@ app.post('/last-message-id', (req, res) => {
 app.post('/claude', async (req, res) => {
   try {
     const apiKey = req.headers['x-api-key'];
-    if (!apiKey) return res.status(400).json({ error: 'x-api-key header required' });
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-     ,
+      body: JSON.stringify(req.body),
       timeout: 180000
     });
     const data = await response.json();
