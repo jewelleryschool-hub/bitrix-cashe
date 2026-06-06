@@ -199,24 +199,24 @@ app.get('/workday', async (req, res) => {
     const dateFrom = date + 'T00:00:00+03:00';
     const dateTo = date + 'T23:59:59+03:00';
 
-    // Задачи
-    let tasks = [];
+    // Задачи — грузим свежие (сортировка по закрытию desc), фильтруем сами
+    let allTasks = [];
     let taskStart = 0;
     let hasMoreTasks = true;
-    while (hasMoreTasks) {
+    while (hasMoreTasks && allTasks.length < 600) {
       let url = WEBHOOK + '/tasks.task.list.json';
       url += '?filter[RESPONSIBLE_ID]=20326';
-      url += '&filter[>=CHANGED_DATE]=' + date;
-      url += '&select[]=ID&select[]=TITLE&select[]=STATUS&select[]=DEADLINE&select[]=CREATED_DATE&select[]=CLOSED_DATE';
+      url += '&order[CLOSED_DATE]=desc';
+      url += '&select[]=ID&select[]=TITLE&select[]=STATUS&select[]=DEADLINE&select[]=CREATED_DATE&select[]=CLOSED_DATE&select[]=CHANGED_DATE';
       url += '&start=' + taskStart;
       try {
         const r = await fetch(url, { timeout: 15000 });
         const d = await r.json();
         if (d.result && d.result.tasks) {
-          tasks = tasks.concat(d.result.tasks);
+          allTasks = allTasks.concat(d.result.tasks);
         }
         const nextVal = d.next ? parseInt(d.next) : null;
-        if (nextVal && nextVal > taskStart && tasks.length < 200) {
+        if (nextVal && nextVal > taskStart) {
           taskStart = nextVal;
         } else {
           hasMoreTasks = false;
@@ -224,26 +224,38 @@ app.get('/workday', async (req, res) => {
       } catch (e) { hasMoreTasks = false; }
       await new Promise(r => setTimeout(r, 300));
     }
+    // Фильтруем задачи активные в этот день: закрыты / созданы / изменены / дедлайн в этот день
+    const tasks = allTasks.filter(t => {
+      const closed = t.closedDate ? t.closedDate.substring(0,10) : '';
+      const created = t.createdDate ? t.createdDate.substring(0,10) : '';
+      const changed = t.changedDate ? t.changedDate.substring(0,10) : '';
+      const deadline = t.deadline ? t.deadline.substring(0,10) : '';
+      return closed === date || created === date || changed === date || deadline === date;
+    });
 
-    // Активности
-    let activities = [];
+    // Активности — грузим свежие, фильтруем сами по дате
+    let allActivities = [];
     let actStart = 0;
     let hasMoreAct = true;
-    while (hasMoreAct) {
+    while (hasMoreAct && allActivities.length < 1000) {
       let url = WEBHOOK + '/crm.activity.list.json';
       url += '?filter[RESPONSIBLE_ID]=20326';
-      url += '&filter[>=CREATED]=' + dateFrom;
-      url += '&filter[<=CREATED]=' + dateTo;
+      url += '&order[CREATED]=desc';
       url += '&select[]=ID&select[]=TYPE_ID&select[]=SUBJECT&select[]=CREATED&select[]=COMPLETED&select[]=DEADLINE';
       url += '&start=' + actStart;
       try {
         const r = await fetch(url, { timeout: 15000 });
         const d = await r.json();
         if (d.result && Array.isArray(d.result)) {
-          activities = activities.concat(d.result);
+          allActivities = allActivities.concat(d.result);
+          // если дошли до активностей старше нужной даты — останавливаемся
+          const oldest = d.result[d.result.length - 1];
+          if (oldest && oldest.CREATED && oldest.CREATED.substring(0,10) < date) {
+            hasMoreAct = false;
+          }
         }
         const nextVal = d.next ? parseInt(d.next) : null;
-        if (nextVal && nextVal > actStart) {
+        if (hasMoreAct && nextVal && nextVal > actStart) {
           actStart = nextVal;
         } else {
           hasMoreAct = false;
@@ -251,6 +263,10 @@ app.get('/workday', async (req, res) => {
       } catch (e) { hasMoreAct = false; }
       await new Promise(r => setTimeout(r, 300));
     }
+    const activities = allActivities.filter(a => {
+      const created = (a.CREATED || '').substring(0,10);
+      return created === date;
+    });
 
     // Переписки за день из общего кэша
     const msgCache = cache['messages_kash_500'];
@@ -272,12 +288,14 @@ app.get('/workday', async (req, res) => {
     }
 
     const tasksClosed = tasks.filter(t => t.closedDate && t.closedDate.substring(0,10) === date).length;
+    const tasksCreated = tasks.filter(t => t.createdDate && t.createdDate.substring(0,10) === date).length;
+    const tasksDeadline = tasks.filter(t => t.deadline && t.deadline.substring(0,10) === date).length;
     const tasksOverdue = tasks.filter(t => t.status !== '5' && t.deadline && new Date(t.deadline) < new Date()).length;
     const tasksOpen = tasks.filter(t => t.status !== '5').length;
 
     const activityByHour = {};
     activities.forEach(a => {
-      const created = a.CREATED || a.created || '';
+      const created = a.CREATED || '';
       if (created.length > 13) {
         const h = parseInt(created.substring(11, 13));
         activityByHour[h] = (activityByHour[h] || 0) + 1;
@@ -291,7 +309,7 @@ app.get('/workday', async (req, res) => {
     });
 
     const allTimes = [
-      ...activities.map(a => a.CREATED || a.created),
+      ...activities.map(a => a.CREATED),
       ...managerDayMsgs.map(m => m.date)
     ].filter(Boolean).sort();
     const firstActivity = allTimes[0] || null;
@@ -302,6 +320,8 @@ app.get('/workday', async (req, res) => {
       tasks: {
         total: tasks.length,
         closed: tasksClosed,
+        created: tasksCreated,
+        deadline: tasksDeadline,
         open: tasksOpen,
         overdue: tasksOverdue,
         list: tasks.slice(0, 50)
