@@ -5,6 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const WEBHOOK = 'https://b24-99blai.bitrix24.ru/rest/1/uop89s51t0hivx0p';
 const WEBHOOK_KASH = 'https://b24-99blai.bitrix24.ru/rest/20326/yyse913stg6uxm80';
+const NL = String.fromCharCode(10);
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -86,9 +87,6 @@ async function fetchChatMessages(webhook, chatId, limit = 100) {
   return [];
 }
 
-// ============================================
-// CRM ДАННЫЕ
-// ============================================
 app.get('/data', async (req, res) => {
   const dateFrom = req.query.dateFrom;
   const dateTo = req.query.dateTo;
@@ -120,9 +118,6 @@ app.get('/data', async (req, res) => {
   }
 });
 
-// ============================================
-// ПЕРЕПИСКИ КАШИНСКОГО
-// ============================================
 app.get('/messages', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const cacheKey = 'messages_kash_' + limit;
@@ -177,14 +172,10 @@ app.get('/messages', async (req, res) => {
   }
 });
 
-// ============================================
-// АНАЛИЗ РАБОЧЕГО ДНЯ КАШИНСКОГО
-// ============================================
 app.get('/workday', async (req, res) => {
   const date = req.query.date || new Date().toISOString().substring(0, 10);
   const cacheKey = 'workday_kash_' + date;
   const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
-
   if (cache[cacheKey] && cacheAge < 1800000) {
     console.log('Cache hit for workday', date);
     return res.json(cache[cacheKey]);
@@ -194,12 +185,10 @@ app.get('/workday', async (req, res) => {
   }
   loading[cacheKey] = true;
   console.log('Loading workday for', date);
-
   try {
     const dateFrom = date + 'T00:00:00+03:00';
     const dateTo = date + 'T23:59:59+03:00';
 
-    // Задачи — грузим свежие (сортировка по закрытию desc), фильтруем сами
     let allTasks = [];
     let taskStart = 0;
     let hasMoreTasks = true;
@@ -212,15 +201,10 @@ app.get('/workday', async (req, res) => {
       try {
         const r = await fetch(url, { timeout: 15000 });
         const d = await r.json();
-        if (d.result && d.result.tasks) {
-          allTasks = allTasks.concat(d.result.tasks);
-        }
+        if (d.result && d.result.tasks) allTasks = allTasks.concat(d.result.tasks);
         const nextVal = d.next ? parseInt(d.next) : null;
-        if (nextVal && nextVal > taskStart) {
-          taskStart = nextVal;
-        } else {
-          hasMoreTasks = false;
-        }
+        if (nextVal && nextVal > taskStart) taskStart = nextVal;
+        else hasMoreTasks = false;
       } catch (e) { hasMoreTasks = false; }
       await new Promise(r => setTimeout(r, 300));
     }
@@ -232,7 +216,6 @@ app.get('/workday', async (req, res) => {
       return closed === date || created === date || changed === date || deadline === date;
     });
 
-    // Активности — грузим свежие, фильтруем сами по дате
     let allActivities = [];
     let actStart = 0;
     let hasMoreAct = true;
@@ -248,25 +231,16 @@ app.get('/workday', async (req, res) => {
         if (d.result && Array.isArray(d.result)) {
           allActivities = allActivities.concat(d.result);
           const oldest = d.result[d.result.length - 1];
-          if (oldest && oldest.CREATED && oldest.CREATED.substring(0,10) < date) {
-            hasMoreAct = false;
-          }
+          if (oldest && oldest.CREATED && oldest.CREATED.substring(0,10) < date) hasMoreAct = false;
         }
         const nextVal = d.next ? parseInt(d.next) : null;
-        if (hasMoreAct && nextVal && nextVal > actStart) {
-          actStart = nextVal;
-        } else {
-          hasMoreAct = false;
-        }
+        if (hasMoreAct && nextVal && nextVal > actStart) actStart = nextVal;
+        else hasMoreAct = false;
       } catch (e) { hasMoreAct = false; }
       await new Promise(r => setTimeout(r, 300));
     }
-    const activities = allActivities.filter(a => {
-      const created = (a.CREATED || '').substring(0,10);
-      return created === date;
-    });
+    const activities = allActivities.filter(a => (a.CREATED || '').substring(0,10) === date);
 
-    // Переписки за день из общего кэша
     const msgCache = cache['messages_kash_500'];
     let dayMessages = [];
     const dialogsByChat = {};
@@ -275,16 +249,15 @@ app.get('/workday', async (req, res) => {
         const chatDayMsgs = [];
         (chat.messages || []).forEach(m => {
           if (m.date && m.date.substring(0, 10) === date) {
-            const entry = {
+            dayMessages.push({
               chat: chat.title,
               author_id: m.author_id,
               text: (m.text || '').substring(0, 200),
               date: m.date,
               hour: parseInt(m.date.substring(11, 13))
-            };
-            dayMessages.push(entry);
+            });
             chatDayMsgs.push({
-              who: m.author_id === 20326 ? 'МЕНЕДЖЕР' : 'КЛИЕНТ',
+              who: m.author_id === 20326 ? 'MANAGER' : 'CLIENT',
               text: (m.text || ''),
               time: m.date.substring(11, 16)
             });
@@ -297,15 +270,17 @@ app.get('/workday', async (req, res) => {
       });
     }
 
-    // Топ-40 диалогов дня по количеству сообщений — полный текст
     const fullDialogs = Object.entries(dialogsByChat)
       .sort((a, b) => b[1].length - a[1].length)
       .slice(0, 40)
-      .map(([title, msgs]) => ({
-        client: title,
-        messages_count: msgs.length,
-        dialog: msgs.map(m => `[${m.time}] ${m.who}: ${m.text}`).join('\n')
-      }));
+      .map(function(pair) {
+        const title = pair[0];
+        const msgs = pair[1];
+        const lines = msgs.map(function(m) {
+          return '[' + m.time + '] ' + (m.who === 'MANAGER' ? 'МЕНЕДЖЕР' : 'КЛИЕНТ') + ': ' + m.text;
+        });
+        return { client: title, messages_count: msgs.length, dialog: lines.join(NL) };
+      });
 
     const tasksClosed = tasks.filter(t => t.closedDate && t.closedDate.substring(0,10) === date).length;
     const tasksCreated = tasks.filter(t => t.createdDate && t.createdDate.substring(0,10) === date).length;
@@ -324,49 +299,23 @@ app.get('/workday', async (req, res) => {
 
     const msgByHour = {};
     const managerDayMsgs = dayMessages.filter(m => m.author_id === 20326);
-    managerDayMsgs.forEach(m => {
-      msgByHour[m.hour] = (msgByHour[m.hour] || 0) + 1;
-    });
+    managerDayMsgs.forEach(m => { msgByHour[m.hour] = (msgByHour[m.hour] || 0) + 1; });
 
-    const allTimes = [
-      ...activities.map(a => a.CREATED),
-      ...managerDayMsgs.map(m => m.date)
-    ].filter(Boolean).sort();
+    const allTimes = [].concat(
+      activities.map(a => a.CREATED),
+      managerDayMsgs.map(m => m.date)
+    ).filter(Boolean).sort();
     const firstActivity = allTimes[0] || null;
     const lastActivity = allTimes[allTimes.length - 1] || null;
 
     const result = {
       date,
-      tasks: {
-        total: tasks.length,
-        closed: tasksClosed,
-        created: tasksCreated,
-        deadline: tasksDeadline,
-        open: tasksOpen,
-        overdue: tasksOverdue,
-        list: tasks.slice(0, 50)
-      },
-      activities: {
-        total: activities.length,
-        completed: activities.filter(a => a.COMPLETED === 'Y').length,
-        byHour: activityByHour,
-        list: activities.slice(0, 50)
-      },
-      messages: {
-        total: dayMessages.length,
-        manager: managerDayMsgs.length,
-        client: dayMessages.filter(m => m.author_id !== 20326 && m.author_id !== 0).length,
-        byHour: msgByHour,
-        sample: managerDayMsgs.slice(0, 30),
-        fullDialogs: fullDialogs
-      },
-      timing: {
-        first: firstActivity,
-        last: lastActivity
-      },
+      tasks: { total: tasks.length, closed: tasksClosed, created: tasksCreated, deadline: tasksDeadline, open: tasksOpen, overdue: tasksOverdue, list: tasks.slice(0, 50) },
+      activities: { total: activities.length, completed: activities.filter(a => a.COMPLETED === 'Y').length, byHour: activityByHour, list: activities.slice(0, 50) },
+      messages: { total: dayMessages.length, manager: managerDayMsgs.length, client: dayMessages.filter(m => m.author_id !== 20326 && m.author_id !== 0).length, byHour: msgByHour, sample: managerDayMsgs.slice(0, 30), fullDialogs: fullDialogs },
+      timing: { first: firstActivity, last: lastActivity },
       updatedAt: new Date().toISOString()
     };
-
     cache[cacheKey] = result;
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
@@ -387,9 +336,6 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', cacheKeys: Object.keys(cache), loading: Object.keys(loading).filter(k => loading[k]) });
 });
 
-// ============================================
-// PROXY — чтение внешних сайтов
-// ============================================
 app.get('/proxy', async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ error: 'url required' });
@@ -406,9 +352,6 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// ============================================
-// LAST MESSAGE ID — антидубль для Romeo
-// ============================================
 app.get('/last-message-id', (req, res) => {
   const chatId = req.query.chat_id;
   if (!chatId) return res.status(400).json({ error: 'chat_id required' });
@@ -423,9 +366,6 @@ app.post('/last-message-id', (req, res) => {
   res.json({ ok: true, chat_id, message_id });
 });
 
-// ============================================
-// CLAUDE API PROXY
-// ============================================
 app.post('/claude', async (req, res) => {
   try {
     const apiKey = req.headers['x-api-key'];
