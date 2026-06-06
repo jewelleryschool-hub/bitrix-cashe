@@ -118,6 +118,106 @@ app.get('/data', async (req, res) => {
   }
 });
 
+// ============================================
+// LEADS STATS — лёгкий агрегат по лидам (без полных переписок)
+// Откуда приходят, статусы, по месяцам, язык. Компактный JSON.
+// ============================================
+function detectSource(entityId) {
+  const e = (entityId || '').toLowerCase();
+  if (e.includes('whatsapp') || e.includes('wa_')) return 'WhatsApp';
+  if (e.includes('instagram') || e.includes('insta')) return 'Instagram';
+  if (e.includes('telegram') || e.includes('tg')) return 'Telegram';
+  if (e.includes('vkontakte') || e.includes('vk_') || e.includes('vk|')) return 'VK';
+  if (e.includes('facebook') || e.includes('fb')) return 'Facebook';
+  if (e.includes('avito')) return 'Avito';
+  if (e.includes('network') || e.includes('livechat') || e.includes('widget')) return 'Site widget';
+  return 'Other/Unknown';
+}
+
+function detectLang(text) {
+  const t = text || '';
+  if (/[\u0600-\u06FF]/.test(t)) return 'ar';      // арабский
+  if (/[\u0400-\u04FF]/.test(t)) return 'ru';      // кириллица
+  if (/[\u00C0-\u017F]|\b(hola|gracias|curso|quiero)\b/i.test(t)) return 'es'; // испанский признаки
+  if (/[a-z]/i.test(t)) return 'en';               // латиница
+  return 'unknown';
+}
+
+app.get('/leads-stats', async (req, res) => {
+  const limit = parseInt(req.query.limit || 500);
+  const webhookParam = req.query.webhook; // опционально другой вебхук
+  const webhook = webhookParam || WEBHOOK_KASH;
+  const cacheKey = 'leads_stats_' + (webhookParam ? webhookParam.slice(-12) : 'kash') + '_' + limit;
+  const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
+
+  if (cache[cacheKey] && cacheAge < 21600000) return res.json(cache[cacheKey]);
+  if (loading[cacheKey]) return res.json({ status: 'loading', message: 'Считаю статистику, попробуйте через 1-2 минуты' });
+  loading[cacheKey] = true;
+
+  try {
+    const chats = await fetchChats(webhook, limit);
+
+    const bySource = {};
+    const byStatus = { new_unassigned: 0, in_progress: 0, closed: 0 };
+    const byMonth = {};
+    const byLang = {};
+    const sourceStatus = {}; // источник -> {open, closed} для конверсии
+
+    for (const chat of chats) {
+      const entityId = chat.chat ? chat.chat.entity_id : '';
+      const source = detectSource(entityId);
+      const status = chat.lines ? chat.lines.status : 0;
+      const lastText = chat.message ? chat.message.text : '';
+      const dateStr = (chat.chat && chat.chat.date_create) ? chat.chat.date_create : (chat.message ? chat.message.date : null);
+
+      // источник
+      bySource[source] = (bySource[source] || 0) + 1;
+
+      // статус
+      let statusKey;
+      if (status === 40) { byStatus.closed++; statusKey = 'closed'; }
+      else if (status === 20 || status === 25) { byStatus.in_progress++; statusKey = 'in_progress'; }
+      else { byStatus.new_unassigned++; statusKey = 'open'; }
+
+      // источник x статус (для конверсии по каналам)
+      if (!sourceStatus[source]) sourceStatus[source] = { total: 0, closed: 0, open: 0, in_progress: 0 };
+      sourceStatus[source].total++;
+      if (statusKey === 'closed') sourceStatus[source].closed++;
+      else if (statusKey === 'in_progress') sourceStatus[source].in_progress++;
+      else sourceStatus[source].open++;
+
+      // по месяцам
+      if (dateStr) {
+        const month = dateStr.substring(0, 7);
+        byMonth[month] = (byMonth[month] || 0) + 1;
+      }
+
+      // язык по последнему сообщению
+      const lang = detectLang(lastText);
+      byLang[lang] = (byLang[lang] || 0) + 1;
+    }
+
+    const result = {
+      total_chats: chats.length,
+      bySource,
+      byStatus,
+      byLang,
+      byMonth,
+      sourceConversion: sourceStatus,
+      note: 'Агрегат без текстов переписок. status: open=новый/без ответа, in_progress=в работе, closed=закрыт',
+      updatedAt: new Date().toISOString()
+    };
+
+    cache[cacheKey] = result;
+    lastUpdate[cacheKey] = Date.now();
+    loading[cacheKey] = false;
+    res.json(result);
+  } catch (error) {
+    loading[cacheKey] = false;
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/messages', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const cacheKey = 'messages_kash_' + limit;
@@ -369,6 +469,7 @@ app.post('/last-message-id', (req, res) => {
 app.post('/claude', async (req, res) => {
   try {
     const apiKey = req.headers['x-api-key'];
+    if (!apiKey) return res.status(400).json({ error: 'x-api-key header required' });
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
