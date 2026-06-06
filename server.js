@@ -224,7 +224,6 @@ app.get('/workday', async (req, res) => {
       } catch (e) { hasMoreTasks = false; }
       await new Promise(r => setTimeout(r, 300));
     }
-    // Фильтруем задачи активные в этот день: закрыты / созданы / изменены / дедлайн в этот день
     const tasks = allTasks.filter(t => {
       const closed = t.closedDate ? t.closedDate.substring(0,10) : '';
       const created = t.createdDate ? t.createdDate.substring(0,10) : '';
@@ -248,7 +247,6 @@ app.get('/workday', async (req, res) => {
         const d = await r.json();
         if (d.result && Array.isArray(d.result)) {
           allActivities = allActivities.concat(d.result);
-          // если дошли до активностей старше нужной даты — останавливаемся
           const oldest = d.result[d.result.length - 1];
           if (oldest && oldest.CREATED && oldest.CREATED.substring(0,10) < date) {
             hasMoreAct = false;
@@ -271,21 +269,43 @@ app.get('/workday', async (req, res) => {
     // Переписки за день из общего кэша
     const msgCache = cache['messages_kash_500'];
     let dayMessages = [];
+    const dialogsByChat = {};
     if (msgCache && msgCache.chats) {
       msgCache.chats.forEach(chat => {
+        const chatDayMsgs = [];
         (chat.messages || []).forEach(m => {
           if (m.date && m.date.substring(0, 10) === date) {
-            dayMessages.push({
+            const entry = {
               chat: chat.title,
               author_id: m.author_id,
               text: (m.text || '').substring(0, 200),
               date: m.date,
               hour: parseInt(m.date.substring(11, 13))
+            };
+            dayMessages.push(entry);
+            chatDayMsgs.push({
+              who: m.author_id === 20326 ? 'МЕНЕДЖЕР' : 'КЛИЕНТ',
+              text: (m.text || ''),
+              time: m.date.substring(11, 16)
             });
           }
         });
+        if (chatDayMsgs.length > 0) {
+          chatDayMsgs.sort((a, b) => a.time.localeCompare(b.time));
+          dialogsByChat[chat.title] = chatDayMsgs;
+        }
       });
     }
+
+    // Топ-40 диалогов дня по количеству сообщений — полный текст
+    const fullDialogs = Object.entries(dialogsByChat)
+      .sort((a, b) => b[1].length - a[1].length)
+      .slice(0, 40)
+      .map(([title, msgs]) => ({
+        client: title,
+        messages_count: msgs.length,
+        dialog: msgs.map(m => `[${m.time}] ${m.who}: ${m.text}`).join('\n')
+      }));
 
     const tasksClosed = tasks.filter(t => t.closedDate && t.closedDate.substring(0,10) === date).length;
     const tasksCreated = tasks.filter(t => t.createdDate && t.createdDate.substring(0,10) === date).length;
@@ -337,7 +357,8 @@ app.get('/workday', async (req, res) => {
         manager: managerDayMsgs.length,
         client: dayMessages.filter(m => m.author_id !== 20326 && m.author_id !== 0).length,
         byHour: msgByHour,
-        sample: managerDayMsgs.slice(0, 30)
+        sample: managerDayMsgs.slice(0, 30),
+        fullDialogs: fullDialogs
       },
       timing: {
         first: firstActivity,
