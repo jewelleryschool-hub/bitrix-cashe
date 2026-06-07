@@ -465,6 +465,79 @@ app.get('/leads-list', async (req, res) => {
   }
 });
 
+// ============================================
+// CHANNELS — ВСЕ каналы по CRM (SOURCE_ID), независимо от оператора.
+// im.recent.list = лента одного пользователя; CRM source = все лиды.
+// ============================================
+function ymd(d) { return d.toISOString().slice(0, 10); }
+app.get('/channels', async (req, res) => {
+  const days = parseInt(req.query.days || 90);
+  const webhook = req.query.webhook || WEBHOOK; // админский по умолчанию
+  const cacheKey = 'channels_' + days;
+  const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
+
+  if (cache[cacheKey] && cacheAge < 21600000) return res.json(cache[cacheKey]);
+  if (loading[cacheKey]) return res.json({ status: 'loading', message: 'Считаю каналы, попробуйте через 1-2 минуты' });
+  loading[cacheKey] = true;
+
+  try {
+    const now = new Date();
+    const dateFrom = ymd(new Date(now.getTime() - days * 86400000));
+    const dateTo = ymd(now);
+
+    // карта SOURCE_ID -> человеческое название канала
+    const sourceMap = {};
+    try {
+      const r = await fetch(webhook + '/crm.status.list.json?filter[ENTITY_ID]=SOURCE', { timeout: 20000 });
+      const j = await r.json();
+      if (j.result) for (const s of j.result) sourceMap[s.STATUS_ID] = s.NAME;
+    } catch (e) {}
+
+    const leads = await fetchAll('crm.lead.list', dateFrom, dateTo, ['ID', 'SOURCE_ID', 'STATUS_ID', 'ASSIGNED_BY_ID', 'DATE_CREATE'], webhook);
+    const deals = await fetchAll('crm.deal.list', dateFrom, dateTo, ['ID', 'SOURCE_ID', 'STAGE_SEMANTIC_ID', 'DATE_CREATE'], webhook);
+
+    const nameOf = id => sourceMap[id] || (id || 'UNKNOWN');
+    const leadsBySource = {};
+    const assignedBySource = {}; // канал -> кто ведёт (id оператора -> кол-во)
+    for (const l of leads) {
+      const s = nameOf(l.SOURCE_ID);
+      leadsBySource[s] = (leadsBySource[s] || 0) + 1;
+      if (!assignedBySource[s]) assignedBySource[s] = {};
+      const a = String(l.ASSIGNED_BY_ID || '0');
+      assignedBySource[s][a] = (assignedBySource[s][a] || 0) + 1;
+    }
+    const dealsBySource = {};
+    for (const d of deals) {
+      const s = nameOf(d.SOURCE_ID);
+      dealsBySource[s] = (dealsBySource[s] || 0) + 1;
+    }
+
+    const conversion = {};
+    const allSources = new Set(Object.keys(leadsBySource).concat(Object.keys(dealsBySource)));
+    allSources.forEach(s => { conversion[s] = { leads: leadsBySource[s] || 0, deals: dealsBySource[s] || 0 }; });
+
+    const result = {
+      period_days: days,
+      total_leads: leads.length,
+      total_deals: deals.length,
+      leadsBySource,
+      dealsBySource,
+      conversion,
+      assignedBySource,
+      note: 'Все каналы по CRM SOURCE_ID за период (админский вебхук), независимо от оператора. assignedBySource: id оператора -> кол-во (видно, кто ведёт канал). 20326 = Кашинский.',
+      updatedAt: new Date().toISOString()
+    };
+
+    cache[cacheKey] = result;
+    lastUpdate[cacheKey] = Date.now();
+    loading[cacheKey] = false;
+    res.json(result);
+  } catch (error) {
+    loading[cacheKey] = false;
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/messages', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const cacheKey = 'messages_kash_' + limit;
