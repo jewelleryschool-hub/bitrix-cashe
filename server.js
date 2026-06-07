@@ -660,12 +660,15 @@ app.get('/register-bot', async (req, res) => {
   const handler = req.query.handler;
   const name = req.query.name || 'Romeo';
   const webhook = req.query.webhook || WEBHOOK;
+  const clientId = req.query.client_id || req.query.clientId;
   if (!handler) return res.status(400).json({ error: 'Передай ?handler=<URL вебхука n8n> — на него Битрикс будет слать события бота (ONIMBOTMESSAGEADD и др.)' });
+  if (!clientId) return res.status(400).json({ error: 'Нужен ещё &client_id=<CLIENT_ID локального приложения>. Бота нельзя регистрировать просто вебхуком — создай Локальное приложение в Битриксе (Разработчикам -> Другое -> Локальное приложение), возьми его client_id и добавь в ссылку.' });
   try {
     const body = {
       CODE: 'romeo',
       TYPE: 'O',
       OPENLINE: 'Y',
+      CLIENT_ID: clientId,
       EVENT_MESSAGE_ADD: handler,
       EVENT_WELCOME_MESSAGE: handler,
       EVENT_BOT_DELETE: handler,
@@ -684,7 +687,7 @@ app.get('/register-bot', async (req, res) => {
     res.json({
       sent: body,
       bitrix_response: data,
-      hint: 'result = ID бота Romeo (запиши его). Если ошибка про scope — добавь вебхуку права imbot и imopenlines. Если TYPE O не примет — попробуй TYPE:B + OPENLINE:Y.'
+      hint: 'result = ID бота Romeo (запиши его). Если снова Client ID — проверь, что приложение создано и client_id верный. Если ошибка про scope — у вебхука/приложения должны быть права imbot и imopenlines.'
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
