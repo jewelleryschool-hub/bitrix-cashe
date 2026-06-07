@@ -651,6 +651,46 @@ app.get('/funnels', async (req, res) => {
   }
 });
 
+// ============================================
+// REGISTER-BOT — разовая регистрация Romeo как бота открытых линий
+// Дёрнуть ОДИН раз: /register-bot?handler=<URL вебхука n8n>
+// Вебхук должен иметь права imbot и imopenlines.
+// ============================================
+app.get('/register-bot', async (req, res) => {
+  const handler = req.query.handler;
+  const name = req.query.name || 'Romeo';
+  const webhook = req.query.webhook || WEBHOOK;
+  if (!handler) return res.status(400).json({ error: 'Передай ?handler=<URL вебхука n8n> — на него Битрикс будет слать события бота (ONIMBOTMESSAGEADD и др.)' });
+  try {
+    const body = {
+      CODE: 'romeo',
+      TYPE: 'O',
+      OPENLINE: 'Y',
+      EVENT_MESSAGE_ADD: handler,
+      EVENT_WELCOME_MESSAGE: handler,
+      EVENT_BOT_DELETE: handler,
+      PROPERTIES: {
+        NAME: name,
+        COLOR: 'AQUA',
+        WORK_POSITION: 'Цифровой помощник школы'
+      }
+    };
+    const r = await fetch(webhook + '/imbot.register.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    res.json({
+      sent: body,
+      bitrix_response: data,
+      hint: 'result = ID бота Romeo (запиши его). Если ошибка про scope — добавь вебхуку права imbot и imopenlines. Если TYPE O не примет — попробуй TYPE:B + OPENLINE:Y.'
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/messages', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const cacheKey = 'messages_kash_' + limit;
