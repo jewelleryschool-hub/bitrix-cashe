@@ -361,6 +361,110 @@ app.get('/leads-debug', async (req, res) => {
   }
 });
 
+// ============================================
+// LEADS LIST — поимённый список диалогов: кто висит, сколько ждёт,
+// сколько до закрытия 24ч окна. Сортировка по срочности.
+// ============================================
+const ROMEO_ID = 80100;
+function authorRole(authorId, managerList, owner) {
+  if (authorId === 0) return 'system';
+  if (authorId === ROMEO_ID) return 'romeo';
+  if ((Array.isArray(managerList) && managerList.indexOf(authorId) !== -1) || authorId === owner) return 'manager';
+  return 'client';
+}
+app.get('/leads-list', async (req, res) => {
+  const limit = parseInt(req.query.limit || 500);
+  const webhookParam = req.query.webhook;
+  const webhook = webhookParam || WEBHOOK_KASH;
+  const cacheKey = 'leads_list_' + (webhookParam ? webhookParam.slice(-12) : 'kash') + '_' + limit;
+  const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
+
+  if (cache[cacheKey] && cacheAge < 1800000) return res.json(cache[cacheKey]);
+  if (loading[cacheKey]) return res.json({ status: 'loading', message: 'Считаю список, попробуйте через 1-2 минуты' });
+  loading[cacheKey] = true;
+
+  try {
+    const chats = await fetchChats(webhook, limit);
+    const now = Date.now();
+    const WINDOW_H = 24;
+    const leads = [];
+
+    for (const chat of chats) {
+      const c = chat.chat || {};
+      if (c.entity_type !== 'LINES' || !c.entity_id) continue;
+
+      const source = detectSource(c.entity_id);
+      const interaction = detectInteraction(c.name, chat.message);
+      const m = chat.message || {};
+      const role = authorRole(m.author_id, c.manager_list, c.owner);
+      const lastDate = m.date ? new Date(m.date).getTime() : (c.date_create ? new Date(c.date_create).getTime() : now);
+      const hoursSince = Math.round(((now - lastDate) / 3600000) * 10) / 10;
+      const awaiting = (role === 'client'); // последнее слово за клиентом → ждёт ответа
+
+      // окно 24ч только для Instagram/WhatsApp (правило Meta); Telegram — без окна
+      const hasWindow = (source === 'Instagram' || source === 'WhatsApp');
+      let windowLeftH = null, windowState = 'na';
+      if (hasWindow && awaiting) {
+        windowLeftH = Math.round((WINDOW_H - hoursSince) * 10) / 10;
+        windowState = windowLeftH <= 0 ? 'closed' : (windowLeftH <= 6 ? 'closing_soon' : 'open');
+      } else if (hasWindow) {
+        windowState = 'answered';
+      }
+
+      const txt = (m.text || '').replace(/\s+/g, ' ').trim();
+      leads.push({
+        name: c.name || '(без имени)',
+        source,
+        interaction,
+        last_from: role,
+        awaiting,
+        hours_since_last: hoursSince,
+        window_left_h: windowLeftH,
+        window_state: windowState,
+        session_status: chat.lines ? chat.lines.status : null,
+        crm_stage: crmStageFrom(c.entity_data_2),
+        last_text: txt.length > 90 ? txt.slice(0, 90) + '…' : txt
+      });
+    }
+
+    // сортировка по срочности: ждущие сначала, среди них — у кого меньше осталось до закрытия окна
+    const rank = { closed: 0, closing_soon: 1, open: 2, na: 3, answered: 4 };
+    leads.sort((a, b) => {
+      if (a.awaiting !== b.awaiting) return a.awaiting ? -1 : 1;
+      const ra = rank[a.window_state], rb = rank[b.window_state];
+      if (ra !== rb) return ra - rb;
+      if (a.window_left_h !== null && b.window_left_h !== null) return a.window_left_h - b.window_left_h;
+      return b.hours_since_last - a.hours_since_last;
+    });
+
+    const awaitingList = leads.filter(l => l.awaiting);
+    const summary = {
+      total_lines: leads.length,
+      awaiting_total: awaitingList.length,
+      awaiting_dm: awaitingList.filter(l => l.interaction === 'dm').length,
+      window_closing_soon: awaitingList.filter(l => l.window_state === 'closing_soon').length,
+      window_closed: awaitingList.filter(l => l.window_state === 'closed').length,
+      by_source_awaiting: {}
+    };
+    for (const l of awaitingList) summary.by_source_awaiting[l.source] = (summary.by_source_awaiting[l.source] || 0) + 1;
+
+    const result = {
+      summary,
+      leads,
+      note: 'awaiting=последнее слово за клиентом (ждёт ответа). window_state: open/closing_soon(<6ч)/closed(>24ч) — только Instagram/WhatsApp; na/answered для остальных. Отсортировано по срочности.',
+      updatedAt: new Date().toISOString()
+    };
+
+    cache[cacheKey] = result;
+    lastUpdate[cacheKey] = Date.now();
+    loading[cacheKey] = false;
+    res.json(result);
+  } catch (error) {
+    loading[cacheKey] = false;
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/messages', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const cacheKey = 'messages_kash_' + limit;
