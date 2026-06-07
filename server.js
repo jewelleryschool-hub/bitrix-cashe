@@ -50,9 +50,12 @@ async function fetchAll(method, dateFrom, dateTo, selectFields, webhook = WEBHOO
 
 async function fetchChats(webhook, limit = 500) {
   let results = [];
+  const seen = {};
   let lastId = 0;
   let hasMore = true;
-  while (hasMore && results.length < limit) {
+  let guard = 0;
+  while (hasMore && results.length < limit && guard < 40) {
+    guard++;
     let url = webhook + '/im.recent.list.json?limit=50';
     if (lastId > 0) url += '&last_id=' + lastId;
     let data = null;
@@ -66,9 +69,23 @@ async function fetchChats(webhook, limit = 500) {
       }
     }
     if (!data || !data.result || !data.result.items) break;
-    results = results.concat(data.result.items);
-    console.log('Chats loaded:', results.length);
-    if (data.result.hasMore && data.next) lastId = data.next;
+    const items = data.result.items;
+    let added = 0;
+    let maxId = lastId;
+    for (const it of items) {
+      const cid = it.chat ? it.chat.id : undefined;
+      if (it.id && it.id > maxId) maxId = it.id;
+      if (cid === undefined || cid === null) continue;
+      if (seen[cid]) continue;
+      seen[cid] = true;
+      results.push(it);
+      added++;
+    }
+    console.log('Chats page:', items.length, 'new:', added, 'total:', results.length);
+    // если страница не дала ни одного нового чата — пагинация зациклилась, стоп
+    if (added === 0) { hasMore = false; break; }
+    if (data.result.hasMore && data.next && data.next !== lastId) lastId = data.next;
+    else if (data.result.hasMore && maxId > lastId) lastId = maxId;
     else hasMore = false;
     await new Promise(r => setTimeout(r, 300));
   }
@@ -143,6 +160,32 @@ function detectLang(text) {
   return 'unknown';
 }
 
+// этап в CRM по entity_data_2 ("LEAD|141728|...|DEAL|0"): дорос ли диалог до сделки
+function crmStageFrom(entityData2) {
+  const parts = (entityData2 || '').split('|');
+  let dealId = 0, leadId = 0;
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (parts[i] === 'DEAL') dealId = parseInt(parts[i + 1]) || 0;
+    if (parts[i] === 'LEAD') leadId = parseInt(parts[i + 1]) || 0;
+  }
+  if (dealId > 0) return 'deal';
+  if (leadId > 0) return 'lead';
+  return 'none';
+}
+
+// тип взаимодействия: dm / comment / story_reaction / reaction
+// comment — по имени чата ("(комментарии)"), остальное — по последнему сообщению
+function detectInteraction(name, message) {
+  const n = (name || '').toLowerCase();
+  if (n.includes('комментар') || n.includes('comment')) return 'comment';
+  const txt = ((message && message.text) ? String(message.text) : '').trim();
+  const low = txt.toLowerCase();
+  if (low.includes('истори') || low.includes('story') || low.includes('отреагир') || low.includes('reacted')) return 'story_reaction';
+  // короткое сообщение без букв/цифр (одни эмодзи) — вероятная реакция
+  if (txt && txt.length <= 4 && !/[a-zа-я0-9]/i.test(txt)) return 'reaction';
+  return 'dm';
+}
+
 app.get('/leads-stats', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const webhookParam = req.query.webhook; // опционально другой вебхук
@@ -159,32 +202,40 @@ app.get('/leads-stats', async (req, res) => {
 
     const bySource = {};
     const byStatus = { new_unassigned: 0, in_progress: 0, closed: 0 };
+    const byCrmStage = { lead: 0, deal: 0, none: 0 };
     const byMonth = {};
     const byLang = {};
-    const sourceStatus = {}; // источник -> {open, closed} для конверсии
+    const sourceStatus = {}; // источник -> статусы + сделки для конверсии
+    let skippedInternal = 0;
 
     for (const chat of chats) {
-      const entityId = chat.chat ? chat.chat.entity_id : '';
-      const source = detectSource(entityId);
+      const c = chat.chat || {};
+      // только реальные открытые линии — служебные (GENERAL/CRM/пустые) пропускаем
+      if (c.entity_type !== 'LINES' || !c.entity_id) { skippedInternal++; continue; }
+
+      const source = detectSource(c.entity_id);
       const status = chat.lines ? chat.lines.status : 0;
+      const stage = crmStageFrom(c.entity_data_2);
       const lastText = chat.message ? chat.message.text : '';
-      const dateStr = (chat.chat && chat.chat.date_create) ? chat.chat.date_create : (chat.message ? chat.message.date : null);
+      const dateStr = c.date_create || (chat.message ? chat.message.date : null);
 
-      // источник
       bySource[source] = (bySource[source] || 0) + 1;
+      byCrmStage[stage] = (byCrmStage[stage] || 0) + 1;
 
-      // статус
+      // статус сессии
       let statusKey;
       if (status === 40) { byStatus.closed++; statusKey = 'closed'; }
       else if (status === 20 || status === 25) { byStatus.in_progress++; statusKey = 'in_progress'; }
       else { byStatus.new_unassigned++; statusKey = 'open'; }
 
-      // источник x статус (для конверсии по каналам)
-      if (!sourceStatus[source]) sourceStatus[source] = { total: 0, closed: 0, open: 0, in_progress: 0 };
+      // источник x (статус + этап CRM)
+      if (!sourceStatus[source]) sourceStatus[source] = { total: 0, open: 0, in_progress: 0, closed: 0, lead: 0, deal: 0 };
       sourceStatus[source].total++;
       if (statusKey === 'closed') sourceStatus[source].closed++;
       else if (statusKey === 'in_progress') sourceStatus[source].in_progress++;
       else sourceStatus[source].open++;
+      if (stage === 'deal') sourceStatus[source].deal++;
+      else if (stage === 'lead') sourceStatus[source].lead++;
 
       // по месяцам
       if (dateStr) {
@@ -199,12 +250,15 @@ app.get('/leads-stats', async (req, res) => {
 
     const result = {
       total_chats: chats.length,
+      lead_chats: chats.length - skippedInternal,
+      skipped_internal: skippedInternal,
       bySource,
       byStatus,
+      byCrmStage,
       byLang,
       byMonth,
       sourceConversion: sourceStatus,
-      note: 'Агрегат без текстов переписок. status: open=новый/без ответа, in_progress=в работе, closed=закрыт',
+      note: 'Только entity_type=LINES (служебные/CRM чаты исключены). status: open=новый/без ответа, in_progress=в работе, closed=закрыт. crmStage: lead=ещё лид, deal=дорос до сделки. Источник = недавние активные диалоги (im.recent.list), не вся история.',
       updatedAt: new Date().toISOString()
     };
 
@@ -241,6 +295,9 @@ app.get('/leads-debug', async (req, res) => {
     const byEntityId = {};
     const byLineId = {};
     const byEntityIdSource = {}; // полный entity_id -> к какому source его относит detectSource
+    const byInteraction = {};        // dm/comment/story_reaction/reaction по всем линиям
+    const bySourceInteraction = {};  // канал -> типы взаимодействия
+    const igMessageSamples = [];     // сырые Instagram-сообщения для настройки детектора
 
     for (const chat of chats) {
       const c = chat.chat || {};
@@ -256,6 +313,19 @@ app.get('/leads-debug', async (req, res) => {
       const parts = eid.split('|');
       const lineId = (lines.id !== undefined ? String(lines.id) : (parts[1] || 'unknown'));
       byLineId[lineId] = (byLineId[lineId] || 0) + 1;
+
+      // тип взаимодействия — только для реальных открытых линий
+      if (etype === 'LINES' && eid) {
+        const source = detectSource(eid);
+        const interaction = detectInteraction(c.name, chat.message);
+        byInteraction[interaction] = (byInteraction[interaction] || 0) + 1;
+        if (!bySourceInteraction[source]) bySourceInteraction[source] = {};
+        bySourceInteraction[source][interaction] = (bySourceInteraction[source][interaction] || 0) + 1;
+        // сырые Instagram-сообщения, чтобы по факту настроить детектор комментов/сторис
+        if (source === 'Instagram' && igMessageSamples.length < 15) {
+          igMessageSamples.push({ name: c.name, detected: interaction, message: chat.message || null });
+        }
+      }
     }
 
     // топ реальных строк entity_id с тем, как detectSource их классифицирует
@@ -270,11 +340,14 @@ app.get('/leads-debug', async (req, res) => {
     const result = {
       total_chats: chats.length,
       byEntityType,
+      byInteraction,
+      bySourceInteraction,
       byLineId,
       distinct_entity_ids: Object.keys(byEntityId).length,
       topEntityIds,
+      igMessageSamples,
       samples,
-      note: 'topEntityIds.detected_as показывает, как текущий detectSource классифицирует строку. byLineId = разбивка по id открытой линии (подканалы). samples = сырые объекты для просмотра всех полей.',
+      note: 'byInteraction/bySourceInteraction: dm=личка, comment=коммент (по имени чата), story_reaction/reaction=реакция (по сообщению). igMessageSamples = сырые Instagram-сообщения для проверки детектора. byLineId = id сессий (не каналы). samples = сырые chat+lines.',
       updatedAt: new Date().toISOString()
     };
 
