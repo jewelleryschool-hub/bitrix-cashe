@@ -538,6 +538,119 @@ app.get('/channels', async (req, res) => {
   }
 });
 
+// ============================================
+// FUNNELS — воронки: статусы лидов + стадии сделок по всем воронкам (CRM, админ-вебхук)
+// ============================================
+async function fetchListNoDate(method, webhook, extra) {
+  let results = [];
+  let start = 0;
+  let more = true;
+  let guard = 0;
+  while (more && guard < 50) {
+    guard++;
+    let url = webhook + '/' + method + '.json?start=' + start;
+    if (extra) url += extra;
+    let data = null;
+    for (let a = 0; a < 3; a++) {
+      try { const r = await fetch(url, { timeout: 20000 }); data = await r.json(); break; }
+      catch (e) { await new Promise(rr => setTimeout(rr, 1500)); }
+    }
+    if (!data || !data.result) break;
+    const arr = Array.isArray(data.result) ? data.result : [];
+    results = results.concat(arr);
+    if (data.next && data.next > start) start = data.next; else more = false;
+    await new Promise(rr => setTimeout(rr, 300));
+  }
+  return results;
+}
+
+app.get('/funnels', async (req, res) => {
+  const days = parseInt(req.query.days || 90);
+  const webhook = req.query.webhook || WEBHOOK;
+  const cacheKey = 'funnels_' + days;
+  const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
+
+  if (cache[cacheKey] && cacheAge < 21600000) return res.json(cache[cacheKey]);
+  if (loading[cacheKey]) return res.json({ status: 'loading', message: 'Считаю воронки, попробуйте через 1-2 минуты' });
+  loading[cacheKey] = true;
+
+  try {
+    const now = new Date();
+    const dateFrom = ymd(new Date(now.getTime() - days * 86400000));
+    const dateTo = ymd(now);
+
+    // имена статусов лидов и стадий сделок (один список на всё)
+    const statuses = await fetchListNoDate('crm.status.list', webhook);
+    const leadStatusName = {};
+    const dealStageName = {};
+    for (const s of statuses) {
+      if (s.ENTITY_ID === 'STATUS') leadStatusName[s.STATUS_ID] = s.NAME;
+      else if (s.ENTITY_ID && s.ENTITY_ID.indexOf('DEAL_STAGE') === 0) dealStageName[s.STATUS_ID] = s.NAME;
+    }
+    // воронки сделок (категории)
+    const cats = await fetchListNoDate('crm.dealcategory.list', webhook);
+    const catName = { '0': 'Основная' };
+    for (const c of cats) catName[String(c.ID)] = c.NAME;
+
+    // лиды по статусам
+    const leads = await fetchAll('crm.lead.list', dateFrom, dateTo, ['ID', 'STATUS_ID', 'DATE_CREATE'], webhook);
+    const leadFunnel = {};
+    for (const l of leads) {
+      const name = leadStatusName[l.STATUS_ID] || l.STATUS_ID || 'UNKNOWN';
+      leadFunnel[name] = (leadFunnel[name] || 0) + 1;
+    }
+    const convertedLeads = leads.filter(l => l.STATUS_ID === 'CONVERTED').length;
+    const junkLeads = leads.filter(l => l.STATUS_ID === 'JUNK').length;
+
+    // сделки по воронкам и стадиям
+    const deals = await fetchAll('crm.deal.list', dateFrom, dateTo, ['ID', 'CATEGORY_ID', 'STAGE_ID', 'STAGE_SEMANTIC_ID', 'OPPORTUNITY', 'DATE_CREATE'], webhook);
+    const dealFunnels = {};
+    let won = 0, lost = 0, inProgress = 0, wonSum = 0;
+    for (const d of deals) {
+      const cn = catName[String(d.CATEGORY_ID || 0)] || ('Воронка ' + d.CATEGORY_ID);
+      if (!dealFunnels[cn]) dealFunnels[cn] = { total: 0, won: 0, lost: 0, in_progress: 0, stages: {} };
+      const f = dealFunnels[cn];
+      f.total++;
+      const sn = dealStageName[d.STAGE_ID] || d.STAGE_ID || 'UNKNOWN';
+      if (!f.stages[sn]) f.stages[sn] = { count: 0, sum: 0 };
+      f.stages[sn].count++;
+      f.stages[sn].sum += Number(d.OPPORTUNITY || 0);
+      const sem = d.STAGE_SEMANTIC_ID;
+      if (sem === 'S') { f.won++; won++; wonSum += Number(d.OPPORTUNITY || 0); }
+      else if (sem === 'F') { f.lost++; lost++; }
+      else { f.in_progress++; inProgress++; }
+    }
+
+    const result = {
+      period_days: days,
+      lead_funnel: {
+        total_leads: leads.length,
+        by_status: leadFunnel,
+        converted: convertedLeads,
+        junk: junkLeads,
+        lead_to_deal_rate: leads.length ? (Math.round((deals.length / leads.length) * 1000) / 10) + '%' : null
+      },
+      deal_funnels: dealFunnels,
+      deals_summary: {
+        total_deals: deals.length,
+        won: won, lost: lost, in_progress: inProgress,
+        won_sum: wonSum,
+        win_rate_closed: (won + lost) ? (Math.round((won / (won + lost)) * 1000) / 10) + '%' : null
+      },
+      note: 'Лиды по статусам и сделки по воронкам/стадиям за период (админ-вебхук). semantic: S=успех(won), F=провал(lost), P=в работе. Конверсия приблизительная: сделки за период / лиды за период (сделка может относиться к лиду из другого периода).',
+      updatedAt: new Date().toISOString()
+    };
+
+    cache[cacheKey] = result;
+    lastUpdate[cacheKey] = Date.now();
+    loading[cacheKey] = false;
+    res.json(result);
+  } catch (error) {
+    loading[cacheKey] = false;
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/messages', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const cacheKey = 'messages_kash_' + limit;
