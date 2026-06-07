@@ -652,6 +652,87 @@ app.get('/funnels', async (req, res) => {
 });
 
 // ============================================
+// BACKLOG-AUDIT — разбор «висящих» лидов. ТОЛЬКО СЧИТАЕТ, ничего не шлёт.
+// /backlog-audit?days=365  (как далеко назад смотреть; по умолчанию 365)
+// Бэклог = лиды НЕ в терминальном статусе (не CONVERTED/выигран и не JUNK/мусор).
+// Возраст берём по DATE_MODIFY (последняя активность) — это прокси «окна 24ч».
+// Точное окно по диалогу проверим позже только на спасаемом сегменте.
+// ============================================
+app.get('/backlog-audit', async (req, res) => {
+  const days = parseInt(req.query.days || 365);
+  const webhook = req.query.webhook || WEBHOOK;
+  try {
+    const now = new Date();
+    const dateFrom = ymd(new Date(now.getTime() - days * 86400000));
+    const dateTo = ymd(now);
+
+    // имена статусов лидов и источников (каналов)
+    const statuses = await fetchListNoDate('crm.status.list', webhook);
+    const leadStatusName = {};
+    const sourceName = {};
+    for (const s of statuses) {
+      if (s.ENTITY_ID === 'STATUS') leadStatusName[s.STATUS_ID] = s.NAME;
+      else if (s.ENTITY_ID === 'SOURCE') sourceName[s.STATUS_ID] = s.NAME;
+    }
+
+    const leads = await fetchAll('crm.lead.list', dateFrom, dateTo,
+      ['ID', 'STATUS_ID', 'SOURCE_ID', 'DATE_CREATE', 'DATE_MODIFY', 'ASSIGNED_BY_ID'], webhook);
+
+    // терминальные статусы — их в бэклог не берём
+    const isTerminal = (st) => st === 'CONVERTED' || st === 'JUNK';
+
+    const ageBucket = (modify) => {
+      const t = modify ? new Date(modify).getTime() : 0;
+      if (!t) return '>30d';
+      const h = (now.getTime() - t) / 3600000;
+      if (h <= 24) return 'open_<24h';
+      if (h <= 24 * 7) return '1-7d';
+      if (h <= 24 * 30) return '7-30d';
+      return '>30d';
+    };
+
+    const out = {
+      total_leads_in_range: leads.length,
+      backlog_total: 0,
+      by_status: {},
+      by_channel: {},
+      by_age: { 'open_<24h': 0, '1-7d': 0, '7-30d': 0, '>30d': 0 },
+      channel_x_age: {},        // канал -> { age -> count }
+      salvageable_open_24h: 0, // окно вероятно открыто
+      salvageable_by_channel: {},
+      terminal_counts: { CONVERTED: 0, JUNK: 0 }
+    };
+
+    for (const l of leads) {
+      const st = l.STATUS_ID;
+      if (isTerminal(st)) { out.terminal_counts[st] = (out.terminal_counts[st] || 0) + 1; continue; }
+      out.backlog_total++;
+
+      const stName = leadStatusName[st] || st || 'UNKNOWN';
+      const chName = sourceName[l.SOURCE_ID] || l.SOURCE_ID || 'UNKNOWN';
+      const age = ageBucket(l.DATE_MODIFY);
+
+      out.by_status[stName] = (out.by_status[stName] || 0) + 1;
+      out.by_channel[chName] = (out.by_channel[chName] || 0) + 1;
+      out.by_age[age] = (out.by_age[age] || 0) + 1;
+
+      if (!out.channel_x_age[chName]) out.channel_x_age[chName] = { 'open_<24h': 0, '1-7d': 0, '7-30d': 0, '>30d': 0 };
+      out.channel_x_age[chName][age]++;
+
+      if (age === 'open_<24h') {
+        out.salvageable_open_24h++;
+        out.salvageable_by_channel[chName] = (out.salvageable_by_channel[chName] || 0) + 1;
+      }
+    }
+
+    out.note = 'Бэклог = лиды не в CONVERTED/JUNK. Возраст по DATE_MODIFY как прокси окна 24ч (open_<24h = окно вероятно открыто, спасаемые; >30d почти точно закрыто). Точное окно по диалогу открытых линий проверяется отдельно. Это аудит, ничего не отправлялось.';
+    res.json(out);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // REGISTER-BOT — разовая регистрация Romeo как бота открытых линий
 // Дёрнуть ОДИН раз: /register-bot?handler=<URL вебхука n8n>
 // Вебхук должен иметь права imbot и imopenlines.
