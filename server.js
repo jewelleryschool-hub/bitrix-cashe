@@ -1003,7 +1003,16 @@ app.get('/workday', async (req, res) => {
     }
     const activities = allActivities.filter(a => (a.CREATED || '').substring(0,10) === date);
 
-    const msgCache = cache['messages_kash_500'];
+    // Загружаем сообщения независимо (не дожидаясь /messages)
+    let msgCache = cache['messages_kash_500'];
+    const msgCacheAge = lastUpdate['messages_kash_500'] ? Date.now() - lastUpdate['messages_kash_500'] : Infinity;
+    
+    if (!msgCache || msgCacheAge > 3600000) {
+      // Кэш отсутствует или старше 1 часа — грузим свежие сообщения
+      const chats = await fetchChats(WEBHOOK_KASH, 500);
+      msgCache = { chats: chats };
+    }
+    
     let dayMessages = [];
     const dialogsByChat = {};
     if (msgCache && msgCache.chats) {
