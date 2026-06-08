@@ -1003,36 +1003,34 @@ app.get('/workday', async (req, res) => {
     }
     const activities = allActivities.filter(a => (a.CREATED || '').substring(0,10) === date);
 
-    // Загружаем сообщения независимо (не дожидаясь /messages)
-    let msgCache = cache['messages_kash_500'];
-    const msgCacheAge = lastUpdate['messages_kash_500'] ? Date.now() - lastUpdate['messages_kash_500'] : Infinity;
-    
+    // Загружаем сообщения (отдельный кэш, не пересекается с /messages)
+    const MGR_ID = 20326;
+    let msgCache = cache['wd_messages_kash'];
+    const msgCacheAge = lastUpdate['wd_messages_kash'] ? Date.now() - lastUpdate['wd_messages_kash'] : Infinity;
+
     if (!msgCache || msgCacheAge > 3600000) {
-      // Кэш отсутствует или старше 1 часа — грузим свежие сообщения
       const chats = await fetchChats(WEBHOOK_KASH, 500);
       const chatsWithMessages = [];
-      
-      // ВАЖНО: для каждого чата грузим сообщения (это медленно, но правильно)
-      for (let i = 0; i < Math.min(chats.length, 200); i++) {
+
+      for (let i = 0; i < chats.length; i++) {
         const chat = chats[i];
-        const chatId = chat.chat_id || chat.id;
+        // настоящий id чата открытой линии — это chat.chat.id
+        const chatId = (chat.chat && chat.chat.id) || chat.chat_id || chat.id;
         if (!chatId) continue;
-        
-        const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 100);
-        chatsWithMessages.push({
-          ...chat,
-          messages: messages
-        });
-        
-        if (i % 50 === 0) console.log('Loaded messages for chat', i + 1, '/', Math.min(chats.length, 200));
-        await new Promise(r => setTimeout(r, 100));
+
+        const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 200);
+        const title = (chat.chat && (chat.chat.name || chat.chat.title)) || chat.title || ('chat ' + chatId);
+        chatsWithMessages.push({ chat_id: chatId, title: title, messages: messages });
+
+        if (i % 100 === 0) console.log('Messages:', i + 1, '/', chats.length);
+        await new Promise(r => setTimeout(r, 50));
       }
-      
+
       msgCache = { chats: chatsWithMessages };
-      await setCache('messages_kash_500', msgCache);
-      lastUpdate['messages_kash_500'] = Date.now();
+      await setCache('wd_messages_kash', msgCache);
+      lastUpdate['wd_messages_kash'] = Date.now();
     }
-    
+
     let dayMessages = [];
     const dialogsByChat = {};
     if (msgCache && msgCache.chats) {
@@ -1040,15 +1038,16 @@ app.get('/workday', async (req, res) => {
         const chatDayMsgs = [];
         (chat.messages || []).forEach(m => {
           if (m.date && m.date.substring(0, 10) === date) {
+            const isManager = Number(m.author_id) === MGR_ID;
             dayMessages.push({
               chat: chat.title,
-              author_id: m.author_id,
+              author_id: Number(m.author_id),
               text: (m.text || '').substring(0, 200),
               date: m.date,
               hour: parseInt(m.date.substring(11, 13))
             });
             chatDayMsgs.push({
-              who: m.author_id === 20326 ? 'MANAGER' : 'CLIENT',
+              who: isManager ? 'MANAGER' : 'CLIENT',
               text: (m.text || ''),
               time: m.date.substring(11, 16)
             });
@@ -1056,21 +1055,20 @@ app.get('/workday', async (req, res) => {
         });
         if (chatDayMsgs.length > 0) {
           chatDayMsgs.sort((a, b) => a.time.localeCompare(b.time));
-          dialogsByChat[chat.title] = chatDayMsgs;
+          // ключ по уникальному id чата (а не названию) — иначе одинаковые названия схлопываются
+          dialogsByChat[chat.chat_id || chat.title] = { title: chat.title, msgs: chatDayMsgs };
         }
       });
     }
 
-    const fullDialogs = Object.entries(dialogsByChat)
-      .sort((a, b) => b[1].length - a[1].length)
-      .slice(0, 40)
-      .map(function(pair) {
-        const title = pair[0];
-        const msgs = pair[1];
-        const lines = msgs.map(function(m) {
+    const fullDialogs = Object.values(dialogsByChat)
+      .sort((a, b) => b.msgs.length - a.msgs.length)
+      .slice(0, 300)
+      .map(function(entry) {
+        const lines = entry.msgs.map(function(m) {
           return '[' + m.time + '] ' + (m.who === 'MANAGER' ? 'МЕНЕДЖЕР' : 'КЛИЕНТ') + ': ' + m.text;
         });
-        return { client: title, messages_count: msgs.length, dialog: lines.join(NL) };
+        return { client: entry.title, messages_count: entry.msgs.length, dialog: lines.join(NL) };
       });
 
     const tasksClosed = tasks.filter(t => t.closedDate && t.closedDate.substring(0,10) === date).length;
@@ -1089,7 +1087,7 @@ app.get('/workday', async (req, res) => {
     });
 
     const msgByHour = {};
-    const managerDayMsgs = dayMessages.filter(m => m.author_id === 20326);
+    const managerDayMsgs = dayMessages.filter(m => Number(m.author_id) === MGR_ID);
     managerDayMsgs.forEach(m => { msgByHour[m.hour] = (msgByHour[m.hour] || 0) + 1; });
 
     const allTimes = [].concat(
@@ -1103,7 +1101,7 @@ app.get('/workday', async (req, res) => {
       date,
       tasks: { total: tasks.length, closed: tasksClosed, created: tasksCreated, deadline: tasksDeadline, open: tasksOpen, overdue: tasksOverdue, list: tasks.slice(0, 50) },
       activities: { total: activities.length, completed: activities.filter(a => a.COMPLETED === 'Y').length, byHour: activityByHour, list: activities.slice(0, 50) },
-      messages: { total: dayMessages.length, manager: managerDayMsgs.length, client: dayMessages.filter(m => m.author_id !== 20326 && m.author_id !== 0).length, byHour: msgByHour, sample: managerDayMsgs.slice(0, 30), fullDialogs: fullDialogs },
+      messages: { total: dayMessages.length, manager: managerDayMsgs.length, client: dayMessages.filter(m => Number(m.author_id) !== MGR_ID && Number(m.author_id) !== 0).length, byHour: msgByHour, sample: managerDayMsgs.slice(0, 30), fullDialogs: fullDialogs },
       timing: { first: firstActivity, last: lastActivity },
       updatedAt: new Date().toISOString()
     };
