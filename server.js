@@ -1010,7 +1010,27 @@ app.get('/workday', async (req, res) => {
     if (!msgCache || msgCacheAge > 3600000) {
       // Кэш отсутствует или старше 1 часа — грузим свежие сообщения
       const chats = await fetchChats(WEBHOOK_KASH, 500);
-      msgCache = { chats: chats };
+      const chatsWithMessages = [];
+      
+      // ВАЖНО: для каждого чата грузим сообщения (это медленно, но правильно)
+      for (let i = 0; i < Math.min(chats.length, 200); i++) {
+        const chat = chats[i];
+        const chatId = chat.chat_id || chat.id;
+        if (!chatId) continue;
+        
+        const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 100);
+        chatsWithMessages.push({
+          ...chat,
+          messages: messages
+        });
+        
+        if (i % 50 === 0) console.log('Loaded messages for chat', i + 1, '/', Math.min(chats.length, 200));
+        await new Promise(r => setTimeout(r, 100));
+      }
+      
+      msgCache = { chats: chatsWithMessages };
+      await setCache('messages_kash_500', msgCache);
+      lastUpdate['messages_kash_500'] = Date.now();
     }
     
     let dayMessages = [];
