@@ -1003,32 +1003,27 @@ app.get('/workday', async (req, res) => {
     }
     const activities = allActivities.filter(a => (a.CREATED || '').substring(0,10) === date);
 
-    // Загружаем сообщения (отдельный кэш, не пересекается с /messages)
+    // Грузим сообщения как в исходном рабочем /messages (та же логика полей),
+    // но независимо — чтобы не нужно было звать /messages вручную. Кэш — в Postgres.
     const MGR_ID = 20326;
-    let msgCache = cache['wd_messages_kash'];
-    const msgCacheAge = lastUpdate['wd_messages_kash'] ? Date.now() - lastUpdate['wd_messages_kash'] : Infinity;
+    let msgCache = cache['messages_kash_500'];
+    const msgCacheAge = lastUpdate['messages_kash_500'] ? Date.now() - lastUpdate['messages_kash_500'] : Infinity;
 
     if (!msgCache || msgCacheAge > 3600000) {
       const chats = await fetchChats(WEBHOOK_KASH, 500);
       const chatsWithMessages = [];
-
       for (let i = 0; i < chats.length; i++) {
         const chat = chats[i];
-        // настоящий id чата открытой линии — это chat.chat.id
-        const chatId = (chat.chat && chat.chat.id) || chat.chat_id || chat.id;
+        const chatId = chat.chat_id || (chat.chat && chat.chat.id); // как в исходнике, с запасным вариантом
         if (!chatId) continue;
-
-        const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 200);
-        const title = (chat.chat && (chat.chat.name || chat.chat.title)) || chat.title || ('chat ' + chatId);
-        chatsWithMessages.push({ chat_id: chatId, title: title, messages: messages });
-
-        if (i % 100 === 0) console.log('Messages:', i + 1, '/', chats.length);
-        await new Promise(r => setTimeout(r, 50));
+        const messages = await fetchChatMessages(WEBHOOK_KASH, chatId, 100);
+        chatsWithMessages.push({ id: chatId, title: chat.title, messages: messages.slice(0, 50) });
+        if (i % 50 === 0) console.log('Messages:', i + 1, '/', chats.length);
+        await new Promise(r => setTimeout(r, 100));
       }
-
       msgCache = { chats: chatsWithMessages };
-      await setCache('wd_messages_kash', msgCache);
-      lastUpdate['wd_messages_kash'] = Date.now();
+      await setCache('messages_kash_500', msgCache);
+      lastUpdate['messages_kash_500'] = Date.now();
     }
 
     let dayMessages = [];
@@ -1038,16 +1033,15 @@ app.get('/workday', async (req, res) => {
         const chatDayMsgs = [];
         (chat.messages || []).forEach(m => {
           if (m.date && m.date.substring(0, 10) === date) {
-            const isManager = Number(m.author_id) === MGR_ID;
             dayMessages.push({
               chat: chat.title,
-              author_id: Number(m.author_id),
+              author_id: m.author_id,
               text: (m.text || '').substring(0, 200),
               date: m.date,
               hour: parseInt(m.date.substring(11, 13))
             });
             chatDayMsgs.push({
-              who: isManager ? 'MANAGER' : 'CLIENT',
+              who: Number(m.author_id) === MGR_ID ? 'MANAGER' : 'CLIENT',
               text: (m.text || ''),
               time: m.date.substring(11, 16)
             });
@@ -1055,15 +1049,15 @@ app.get('/workday', async (req, res) => {
         });
         if (chatDayMsgs.length > 0) {
           chatDayMsgs.sort((a, b) => a.time.localeCompare(b.time));
-          // ключ по уникальному id чата (а не названию) — иначе одинаковые названия схлопываются
-          dialogsByChat[chat.chat_id || chat.title] = { title: chat.title, msgs: chatDayMsgs };
+          // ключ по id чата (не по названию) — иначе чаты с одинаковым именем схлопываются
+          dialogsByChat[chat.id || chat.title] = { title: chat.title, msgs: chatDayMsgs };
         }
       });
     }
 
     const fullDialogs = Object.values(dialogsByChat)
       .sort((a, b) => b.msgs.length - a.msgs.length)
-      .slice(0, 300)
+      .slice(0, 300) // было 40 — теперь показываем все диалоги дня
       .map(function(entry) {
         const lines = entry.msgs.map(function(m) {
           return '[' + m.time + '] ' + (m.who === 'MANAGER' ? 'МЕНЕДЖЕР' : 'КЛИЕНТ') + ': ' + m.text;
