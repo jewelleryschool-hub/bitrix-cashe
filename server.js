@@ -1,6 +1,109 @@
 const express = require('express');
 const fetch = require('node-fetch');
 
+// ============================================
+// POSTGRES CACHE (опционально, с грациозной деградацией)
+// ============================================
+let pg = null;
+let pgPool = null;
+let pgReady = false;
+
+try {
+  pg = require('pg');
+  const { Pool } = pg;
+  const dbUrl = process.env.DATABASE_URL;
+  if (dbUrl) {
+    pgPool = new Pool({ connectionString: dbUrl, ssl: { rejectUnauthorized: false } });
+    pgPool.on('error', (err) => console.log('⚠️ Postgres pool error:', err.message));
+    pgReady = true;
+    console.log('✓ Postgres инициализирован');
+  }
+} catch (err) {
+  console.log('ℹ️ Postgres недоступен (работаем в in-memory режиме):', err.message);
+}
+
+// Инициализация таблицы кэша
+async function initPgCache() {
+  if (!pgPool) return;
+  try {
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS cache (
+        key TEXT PRIMARY KEY,
+        value JSONB NOT NULL,
+        updated_at BIGINT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_cache_updated ON cache(updated_at);
+    `);
+    console.log('✓ Таблица cache готова');
+  } catch (err) {
+    console.log('⚠️ Ошибка инициализации таблицы cache:', err.message);
+  }
+}
+
+// Хелперы для работы с Postgres кэшем
+async function pgSetCache(key, value) {
+  if (!pgPool) return;
+  try {
+    const now = Date.now();
+    await pgPool.query(
+      'INSERT INTO cache(key, value, updated_at) VALUES($1, $2, $3) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at',
+      [key, JSON.stringify(value), now]
+    );
+  } catch (err) {
+    console.log('⚠️ pgSetCache error:', key, err.message);
+  }
+}
+
+async function pgGetCache(key) {
+  if (!pgPool) return null;
+  try {
+    const result = await pgPool.query('SELECT value FROM cache WHERE key=$1', [key]);
+    return result.rows[0] ? JSON.parse(result.rows[0].value) : null;
+  } catch (err) {
+    console.log('⚠️ pgGetCache error:', key, err.message);
+    return null;
+  }
+}
+
+async function pgDeleteCache(key) {
+  if (!pgPool) return;
+  try {
+    await pgPool.query('DELETE FROM cache WHERE key=$1', [key]);
+  } catch (err) {
+    console.log('⚠️ pgDeleteCache error:', key, err.message);
+  }
+}
+
+async function pgClearAllCache() {
+  if (!pgPool) return;
+  try {
+    await pgPool.query('DELETE FROM cache');
+    console.log('✓ Postgres кэш очищен');
+  } catch (err) {
+    console.log('⚠️ pgClearAllCache error:', err.message);
+  }
+}
+
+async function pgLoadAllIntoMemory(cache) {
+  if (!pgPool) return;
+  try {
+    const result = await pgPool.query('SELECT key, value FROM cache');
+    let loaded = 0;
+    for (const row of result.rows) {
+      try {
+        cache[row.key] = JSON.parse(row.value);
+        loaded++;
+      } catch (e) {}
+    }
+    console.log(`✓ Загружено ${loaded} ключей из Postgres в память`);
+  } catch (err) {
+    console.log('⚠️ pgLoadAllIntoMemory error:', err.message);
+  }
+}
+
+// ============================================
+// EXPRESS APP
+// ============================================
 const app = express();
 const PORT = process.env.PORT || 3000;
 const WEBHOOK = 'https://b24-99blai.bitrix24.ru/rest/1/uop89s51t0hivx0p';
@@ -14,6 +117,15 @@ let lastUpdate = {};
 let loading = {};
 let lastMessageIds = {};
 
+// Обёртка для кэша: устанавливает в память И в Postgres
+async function setCache(key, value) {
+  cache[key] = value;
+  await pgSetCache(key, value);
+}
+
+// ============================================
+// BITRIX API HELPERS
+// ============================================
 async function fetchAll(method, dateFrom, dateTo, selectFields, webhook = WEBHOOK) {
   let results = [];
   let start = 0;
@@ -82,7 +194,6 @@ async function fetchChats(webhook, limit = 500) {
       added++;
     }
     console.log('Chats page:', items.length, 'new:', added, 'total:', results.length);
-    // если страница не дала ни одного нового чата — пагинация зациклилась, стоп
     if (added === 0) { hasMore = false; break; }
     if (data.result.hasMore && data.next && data.next !== lastId) lastId = data.next;
     else if (data.result.hasMore && maxId > lastId) lastId = maxId;
@@ -104,6 +215,9 @@ async function fetchChatMessages(webhook, chatId, limit = 100) {
   return [];
 }
 
+// ============================================
+// ENDPOINTS
+// ============================================
 app.get('/data', async (req, res) => {
   const dateFrom = req.query.dateFrom;
   const dateTo = req.query.dateTo;
@@ -125,7 +239,7 @@ app.get('/data', async (req, res) => {
     const deals = await fetchAll('crm.deal.list', dateFrom, dateTo, ['ID','TITLE','STAGE_SEMANTIC_ID','SOURCE_ID','OPPORTUNITY','CURRENCY_ID','DATE_CREATE','CATEGORY_ID','ASSIGNED_BY_ID']);
     const leads = await fetchAll('crm.lead.list', dateFrom, dateTo, ['ID','STATUS_ID','ASSIGNED_BY_ID','SOURCE_ID','DATE_CREATE']);
     const result = { deals, leads, dealsTotal: deals.length, leadsTotal: leads.length, updatedAt: new Date().toISOString() };
-    cache[cacheKey] = result;
+    await setCache(cacheKey, result);
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
     res.json(result);
@@ -135,10 +249,6 @@ app.get('/data', async (req, res) => {
   }
 });
 
-// ============================================
-// LEADS STATS — лёгкий агрегат по лидам (без полных переписок)
-// Откуда приходят, статусы, по месяцам, язык. Компактный JSON.
-// ============================================
 function detectSource(entityId) {
   const e = (entityId || '').toLowerCase();
   if (e.includes('whatsapp') || e.includes('wa_')) return 'WhatsApp';
@@ -153,14 +263,13 @@ function detectSource(entityId) {
 
 function detectLang(text) {
   const t = text || '';
-  if (/[\u0600-\u06FF]/.test(t)) return 'ar';      // арабский
-  if (/[\u0400-\u04FF]/.test(t)) return 'ru';      // кириллица
-  if (/[\u00C0-\u017F]|\b(hola|gracias|curso|quiero)\b/i.test(t)) return 'es'; // испанский признаки
-  if (/[a-z]/i.test(t)) return 'en';               // латиница
+  if (/[\u0600-\u06FF]/.test(t)) return 'ar';
+  if (/[\u0400-\u04FF]/.test(t)) return 'ru';
+  if (/[\u00C0-\u017F]|\b(hola|gracias|curso|quiero)\b/i.test(t)) return 'es';
+  if (/[a-z]/i.test(t)) return 'en';
   return 'unknown';
 }
 
-// этап в CRM по entity_data_2 ("LEAD|141728|...|DEAL|0"): дорос ли диалог до сделки
 function crmStageFrom(entityData2) {
   const parts = (entityData2 || '').split('|');
   let dealId = 0, leadId = 0;
@@ -173,22 +282,19 @@ function crmStageFrom(entityData2) {
   return 'none';
 }
 
-// тип взаимодействия: dm / comment / story_reaction / reaction
-// comment — по имени чата ("(комментарии)"), остальное — по последнему сообщению
 function detectInteraction(name, message) {
   const n = (name || '').toLowerCase();
   if (n.includes('комментар') || n.includes('comment')) return 'comment';
   const txt = ((message && message.text) ? String(message.text) : '').trim();
   const low = txt.toLowerCase();
   if (low.includes('истори') || low.includes('story') || low.includes('отреагир') || low.includes('reacted')) return 'story_reaction';
-  // короткое сообщение без букв/цифр (одни эмодзи) — вероятная реакция
   if (txt && txt.length <= 4 && !/[a-zа-я0-9]/i.test(txt)) return 'reaction';
   return 'dm';
 }
 
 app.get('/leads-stats', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
-  const webhookParam = req.query.webhook; // опционально другой вебхук
+  const webhookParam = req.query.webhook;
   const webhook = webhookParam || WEBHOOK_KASH;
   const cacheKey = 'leads_stats_' + (webhookParam ? webhookParam.slice(-12) : 'kash') + '_' + limit;
   const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
@@ -205,12 +311,11 @@ app.get('/leads-stats', async (req, res) => {
     const byCrmStage = { lead: 0, deal: 0, none: 0 };
     const byMonth = {};
     const byLang = {};
-    const sourceStatus = {}; // источник -> статусы + сделки для конверсии
+    const sourceStatus = {};
     let skippedInternal = 0;
 
     for (const chat of chats) {
       const c = chat.chat || {};
-      // только реальные открытые линии — служебные (GENERAL/CRM/пустые) пропускаем
       if (c.entity_type !== 'LINES' || !c.entity_id) { skippedInternal++; continue; }
 
       const source = detectSource(c.entity_id);
@@ -222,13 +327,11 @@ app.get('/leads-stats', async (req, res) => {
       bySource[source] = (bySource[source] || 0) + 1;
       byCrmStage[stage] = (byCrmStage[stage] || 0) + 1;
 
-      // статус сессии
       let statusKey;
       if (status === 40) { byStatus.closed++; statusKey = 'closed'; }
       else if (status === 20 || status === 25) { byStatus.in_progress++; statusKey = 'in_progress'; }
       else { byStatus.new_unassigned++; statusKey = 'open'; }
 
-      // источник x (статус + этап CRM)
       if (!sourceStatus[source]) sourceStatus[source] = { total: 0, open: 0, in_progress: 0, closed: 0, lead: 0, deal: 0 };
       sourceStatus[source].total++;
       if (statusKey === 'closed') sourceStatus[source].closed++;
@@ -237,13 +340,11 @@ app.get('/leads-stats', async (req, res) => {
       if (stage === 'deal') sourceStatus[source].deal++;
       else if (stage === 'lead') sourceStatus[source].lead++;
 
-      // по месяцам
       if (dateStr) {
         const month = dateStr.substring(0, 7);
         byMonth[month] = (byMonth[month] || 0) + 1;
       }
 
-      // язык по последнему сообщению
       const lang = detectLang(lastText);
       byLang[lang] = (byLang[lang] || 0) + 1;
     }
@@ -258,11 +359,11 @@ app.get('/leads-stats', async (req, res) => {
       byLang,
       byMonth,
       sourceConversion: sourceStatus,
-      note: 'Только entity_type=LINES (служебные/CRM чаты исключены). status: open=новый/без ответа, in_progress=в работе, closed=закрыт. crmStage: lead=ещё лид, deal=дорос до сделки. Источник = недавние активные диалоги (im.recent.list), не вся история.',
+      note: 'Только entity_type=LINES. status: open=новый/без ответа, in_progress=в работе, closed=закрыт.',
       updatedAt: new Date().toISOString()
     };
 
-    cache[cacheKey] = result;
+    await setCache(cacheKey, result);
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
     res.json(result);
@@ -272,11 +373,6 @@ app.get('/leads-stats', async (req, res) => {
   }
 });
 
-// ============================================
-// LEADS DEBUG — диагностика внутриканального разделения (read-only)
-// Показывает реальные entity_id, id линий, типы и сырые примеры.
-// Нужен, чтобы увидеть подканалы и расшифровать Other/Unknown.
-// ============================================
 app.get('/leads-debug', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const webhookParam = req.query.webhook;
@@ -294,10 +390,10 @@ app.get('/leads-debug', async (req, res) => {
     const byEntityType = {};
     const byEntityId = {};
     const byLineId = {};
-    const byEntityIdSource = {}; // полный entity_id -> к какому source его относит detectSource
-    const byInteraction = {};        // dm/comment/story_reaction/reaction по всем линиям
-    const bySourceInteraction = {};  // канал -> типы взаимодействия
-    const igMessageSamples = [];     // сырые Instagram-сообщения для настройки детектора
+    const byEntityIdSource = {};
+    const byInteraction = {};
+    const bySourceInteraction = {};
+    const igMessageSamples = [];
 
     for (const chat of chats) {
       const c = chat.chat || {};
@@ -309,32 +405,27 @@ app.get('/leads-debug', async (req, res) => {
       byEntityId[eid] = (byEntityId[eid] || 0) + 1;
       if (!byEntityIdSource[eid]) byEntityIdSource[eid] = detectSource(eid);
 
-      // id линии: сначала из lines.id, иначе из частей entity_id (livechat|6|... -> 6)
       const parts = eid.split('|');
       const lineId = (lines.id !== undefined ? String(lines.id) : (parts[1] || 'unknown'));
       byLineId[lineId] = (byLineId[lineId] || 0) + 1;
 
-      // тип взаимодействия — только для реальных открытых линий
       if (etype === 'LINES' && eid) {
         const source = detectSource(eid);
         const interaction = detectInteraction(c.name, chat.message);
         byInteraction[interaction] = (byInteraction[interaction] || 0) + 1;
         if (!bySourceInteraction[source]) bySourceInteraction[source] = {};
         bySourceInteraction[source][interaction] = (bySourceInteraction[source][interaction] || 0) + 1;
-        // сырые Instagram-сообщения, чтобы по факту настроить детектор комментов/сторис
         if (source === 'Instagram' && igMessageSamples.length < 15) {
           igMessageSamples.push({ name: c.name, detected: interaction, message: chat.message || null });
         }
       }
     }
 
-    // топ реальных строк entity_id с тем, как detectSource их классифицирует
     const topEntityIds = Object.keys(byEntityId)
       .sort((a, b) => byEntityId[b] - byEntityId[a])
       .slice(0, 40)
       .map(eid => ({ entity_id: eid, count: byEntityId[eid], detected_as: byEntityIdSource[eid] }));
 
-    // сырые примеры целиком — чтобы видеть ВСЕ доступные поля chat + lines
     const samples = chats.slice(0, 8).map(ch => ({ chat: ch.chat || null, lines: ch.lines || null }));
 
     const result = {
@@ -347,11 +438,11 @@ app.get('/leads-debug', async (req, res) => {
       topEntityIds,
       igMessageSamples,
       samples,
-      note: 'byInteraction/bySourceInteraction: dm=личка, comment=коммент (по имени чата), story_reaction/reaction=реакция (по сообщению). igMessageSamples = сырые Instagram-сообщения для проверки детектора. byLineId = id сессий (не каналы). samples = сырые chat+lines.',
+      note: 'byInteraction/bySourceInteraction: dm/comment/story_reaction/reaction. samples = сырые chat+lines.',
       updatedAt: new Date().toISOString()
     };
 
-    cache[cacheKey] = result;
+    await setCache(cacheKey, result);
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
     res.json(result);
@@ -361,10 +452,6 @@ app.get('/leads-debug', async (req, res) => {
   }
 });
 
-// ============================================
-// LEADS LIST — поимённый список диалогов: кто висит, сколько ждёт,
-// сколько до закрытия 24ч окна. Сортировка по срочности.
-// ============================================
 const ROMEO_ID = 80100;
 function authorRole(authorId, managerList, owner) {
   if (authorId === 0) return 'system';
@@ -372,6 +459,7 @@ function authorRole(authorId, managerList, owner) {
   if ((Array.isArray(managerList) && managerList.indexOf(authorId) !== -1) || authorId === owner) return 'manager';
   return 'client';
 }
+
 app.get('/leads-list', async (req, res) => {
   const limit = parseInt(req.query.limit || 500);
   const webhookParam = req.query.webhook;
@@ -399,9 +487,8 @@ app.get('/leads-list', async (req, res) => {
       const role = authorRole(m.author_id, c.manager_list, c.owner);
       const lastDate = m.date ? new Date(m.date).getTime() : (c.date_create ? new Date(c.date_create).getTime() : now);
       const hoursSince = Math.round(((now - lastDate) / 3600000) * 10) / 10;
-      const awaiting = (role === 'client'); // последнее слово за клиентом → ждёт ответа
+      const awaiting = (role === 'client');
 
-      // окно 24ч только для Instagram/WhatsApp (правило Meta); Telegram — без окна
       const hasWindow = (source === 'Instagram' || source === 'WhatsApp');
       let windowLeftH = null, windowState = 'na';
       if (hasWindow && awaiting) {
@@ -427,7 +514,6 @@ app.get('/leads-list', async (req, res) => {
       });
     }
 
-    // сортировка по срочности: ждущие сначала, среди них — у кого меньше осталось до закрытия окна
     const rank = { closed: 0, closing_soon: 1, open: 2, na: 3, answered: 4 };
     leads.sort((a, b) => {
       if (a.awaiting !== b.awaiting) return a.awaiting ? -1 : 1;
@@ -451,11 +537,11 @@ app.get('/leads-list', async (req, res) => {
     const result = {
       summary,
       leads,
-      note: 'awaiting=последнее слово за клиентом (ждёт ответа). window_state: open/closing_soon(<6ч)/closed(>24ч) — только Instagram/WhatsApp; na/answered для остальных. Отсортировано по срочности.',
+      note: 'awaiting=ждёт ответа. window_state: open/closing_soon/closed для IG/WA; na/answered для остальных.',
       updatedAt: new Date().toISOString()
     };
 
-    cache[cacheKey] = result;
+    await setCache(cacheKey, result);
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
     res.json(result);
@@ -465,14 +551,11 @@ app.get('/leads-list', async (req, res) => {
   }
 });
 
-// ============================================
-// CHANNELS — ВСЕ каналы по CRM (SOURCE_ID), независимо от оператора.
-// im.recent.list = лента одного пользователя; CRM source = все лиды.
-// ============================================
 function ymd(d) { return d.toISOString().slice(0, 10); }
+
 app.get('/channels', async (req, res) => {
   const days = parseInt(req.query.days || 90);
-  const webhook = req.query.webhook || WEBHOOK; // админский по умолчанию
+  const webhook = req.query.webhook || WEBHOOK;
   const cacheKey = 'channels_' + days;
   const cacheAge = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
 
@@ -485,7 +568,6 @@ app.get('/channels', async (req, res) => {
     const dateFrom = ymd(new Date(now.getTime() - days * 86400000));
     const dateTo = ymd(now);
 
-    // карта SOURCE_ID -> человеческое название канала
     const sourceMap = {};
     try {
       const r = await fetch(webhook + '/crm.status.list.json?filter[ENTITY_ID]=SOURCE', { timeout: 20000 });
@@ -498,7 +580,7 @@ app.get('/channels', async (req, res) => {
 
     const nameOf = id => sourceMap[id] || (id || 'UNKNOWN');
     const leadsBySource = {};
-    const assignedBySource = {}; // канал -> кто ведёт (id оператора -> кол-во)
+    const assignedBySource = {};
     for (const l of leads) {
       const s = nameOf(l.SOURCE_ID);
       leadsBySource[s] = (leadsBySource[s] || 0) + 1;
@@ -524,11 +606,11 @@ app.get('/channels', async (req, res) => {
       dealsBySource,
       conversion,
       assignedBySource,
-      note: 'Все каналы по CRM SOURCE_ID за период (админский вебхук), независимо от оператора. assignedBySource: id оператора -> кол-во (видно, кто ведёт канал). 20326 = Кашинский.',
+      note: 'Все каналы по CRM SOURCE_ID за период (админский вебхук). 20326 = Кашинский.',
       updatedAt: new Date().toISOString()
     };
 
-    cache[cacheKey] = result;
+    await setCache(cacheKey, result);
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
     res.json(result);
@@ -538,9 +620,6 @@ app.get('/channels', async (req, res) => {
   }
 });
 
-// ============================================
-// FUNNELS — воронки: статусы лидов + стадии сделок по всем воронкам (CRM, админ-вебхук)
-// ============================================
 async function fetchListNoDate(method, webhook, extra) {
   let results = [];
   let start = 0;
@@ -579,7 +658,6 @@ app.get('/funnels', async (req, res) => {
     const dateFrom = ymd(new Date(now.getTime() - days * 86400000));
     const dateTo = ymd(now);
 
-    // имена статусов лидов и стадий сделок (один список на всё)
     const statuses = await fetchListNoDate('crm.status.list', webhook);
     const leadStatusName = {};
     const dealStageName = {};
@@ -587,12 +665,11 @@ app.get('/funnels', async (req, res) => {
       if (s.ENTITY_ID === 'STATUS') leadStatusName[s.STATUS_ID] = s.NAME;
       else if (s.ENTITY_ID && s.ENTITY_ID.indexOf('DEAL_STAGE') === 0) dealStageName[s.STATUS_ID] = s.NAME;
     }
-    // воронки сделок (категории)
+
     const cats = await fetchListNoDate('crm.dealcategory.list', webhook);
     const catName = { '0': 'Основная' };
     for (const c of cats) catName[String(c.ID)] = c.NAME;
 
-    // лиды по статусам
     const leads = await fetchAll('crm.lead.list', dateFrom, dateTo, ['ID', 'STATUS_ID', 'DATE_CREATE'], webhook);
     const leadFunnel = {};
     for (const l of leads) {
@@ -602,7 +679,6 @@ app.get('/funnels', async (req, res) => {
     const convertedLeads = leads.filter(l => l.STATUS_ID === 'CONVERTED').length;
     const junkLeads = leads.filter(l => l.STATUS_ID === 'JUNK').length;
 
-    // сделки по воронкам и стадиям
     const deals = await fetchAll('crm.deal.list', dateFrom, dateTo, ['ID', 'CATEGORY_ID', 'STAGE_ID', 'STAGE_SEMANTIC_ID', 'OPPORTUNITY', 'DATE_CREATE'], webhook);
     const dealFunnels = {};
     let won = 0, lost = 0, inProgress = 0, wonSum = 0;
@@ -637,11 +713,11 @@ app.get('/funnels', async (req, res) => {
         won_sum: wonSum,
         win_rate_closed: (won + lost) ? (Math.round((won / (won + lost)) * 1000) / 10) + '%' : null
       },
-      note: 'Лиды по статусам и сделки по воронкам/стадиям за период (админ-вебхук). semantic: S=успех(won), F=провал(lost), P=в работе. Конверсия приблизительная: сделки за период / лиды за период (сделка может относиться к лиду из другого периода).',
+      note: 'Лиды по статусам и сделки по воронкам/стадиям за период.',
       updatedAt: new Date().toISOString()
     };
 
-    cache[cacheKey] = result;
+    await setCache(cacheKey, result);
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
     res.json(result);
@@ -651,13 +727,6 @@ app.get('/funnels', async (req, res) => {
   }
 });
 
-// ============================================
-// BACKLOG-AUDIT — разбор «висящих» лидов. ТОЛЬКО СЧИТАЕТ, ничего не шлёт.
-// /backlog-audit?days=365  (как далеко назад смотреть; по умолчанию 365)
-// Бэклог = лиды НЕ в терминальном статусе (не CONVERTED/выигран и не JUNK/мусор).
-// Возраст берём по DATE_MODIFY (последняя активность) — это прокси «окна 24ч».
-// Точное окно по диалогу проверим позже только на спасаемом сегменте.
-// ============================================
 app.get('/backlog-audit', async (req, res) => {
   const days = parseInt(req.query.days || 365);
   const webhook = req.query.webhook || WEBHOOK;
@@ -666,7 +735,6 @@ app.get('/backlog-audit', async (req, res) => {
     const dateFrom = ymd(new Date(now.getTime() - days * 86400000));
     const dateTo = ymd(now);
 
-    // имена статусов лидов и источников (каналов)
     const statuses = await fetchListNoDate('crm.status.list', webhook);
     const leadStatusName = {};
     const sourceName = {};
@@ -678,7 +746,6 @@ app.get('/backlog-audit', async (req, res) => {
     const leads = await fetchAll('crm.lead.list', dateFrom, dateTo,
       ['ID', 'STATUS_ID', 'SOURCE_ID', 'DATE_CREATE', 'DATE_MODIFY', 'ASSIGNED_BY_ID'], webhook);
 
-    // терминальные статусы — их в бэклог не берём
     const isTerminal = (st) => st === 'CONVERTED' || st === 'JUNK';
 
     const ageBucket = (modify) => {
@@ -697,8 +764,8 @@ app.get('/backlog-audit', async (req, res) => {
       by_status: {},
       by_channel: {},
       by_age: { 'open_<24h': 0, '1-7d': 0, '7-30d': 0, '>30d': 0 },
-      channel_x_age: {},        // канал -> { age -> count }
-      salvageable_open_24h: 0, // окно вероятно открыто
+      channel_x_age: {},
+      salvageable_open_24h: 0,
       salvageable_by_channel: {},
       terminal_counts: { CONVERTED: 0, JUNK: 0 }
     };
@@ -725,25 +792,20 @@ app.get('/backlog-audit', async (req, res) => {
       }
     }
 
-    out.note = 'Бэклог = лиды не в CONVERTED/JUNK. Возраст по DATE_MODIFY как прокси окна 24ч (open_<24h = окно вероятно открыто, спасаемые; >30d почти точно закрыто). Точное окно по диалогу открытых линий проверяется отдельно. Это аудит, ничего не отправлялось.';
+    out.note = 'Бэклог = не в CONVERTED/JUNK. Возраст по DATE_MODIFY. Это аудит, ничего не отправлялось.';
     res.json(out);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// ============================================
-// REGISTER-BOT — разовая регистрация Romeo как бота открытых линий
-// Дёрнуть ОДИН раз: /register-bot?handler=<URL вебхука n8n>
-// Вебхук должен иметь права imbot и imopenlines.
-// ============================================
 app.get('/register-bot', async (req, res) => {
   const handler = req.query.handler;
   const name = req.query.name || 'Romeo';
   const webhook = req.query.webhook || WEBHOOK;
   const clientId = req.query.client_id || req.query.clientId;
-  if (!handler) return res.status(400).json({ error: 'Передай ?handler=<URL вебхука n8n> — на него Битрикс будет слать события бота (ONIMBOTMESSAGEADD и др.)' });
-  if (!clientId) return res.status(400).json({ error: 'Нужен ещё &client_id=<CLIENT_ID локального приложения>. Бота нельзя регистрировать просто вебхуком — создай Локальное приложение в Битриксе (Разработчикам -> Другое -> Локальное приложение), возьми его client_id и добавь в ссылку.' });
+  if (!handler) return res.status(400).json({ error: 'Передай ?handler=<URL вебхука n8n>' });
+  if (!clientId) return res.status(400).json({ error: 'Нужен &client_id=<CLIENT_ID локального приложения>' });
   try {
     const body = {
       CODE: 'romeo',
@@ -768,7 +830,50 @@ app.get('/register-bot', async (req, res) => {
     res.json({
       sent: body,
       bitrix_response: data,
-      hint: 'result = ID бота Romeo (запиши его). Если снова Client ID — проверь, что приложение создано и client_id верный. Если ошибка про scope — у вебхука/приложения должны быть права imbot и imopenlines.'
+      hint: 'result = ID бота Romeo (запиши его).'
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================
+// UPDATE-BOT — обновить регистрацию бота (добавлено)
+// ============================================
+app.get('/update-bot', async (req, res) => {
+  const handler = req.query.handler || process.env.ROMEO_WEBHOOK_HANDLER;
+  const botId = req.query.bot_id || process.env.ROMEO_BOT_ID || '80100';
+  const webhook = req.query.webhook || WEBHOOK;
+  
+  if (!handler) {
+    return res.status(400).json({ 
+      error: 'Передай ?handler=<URL вебхука n8n> или установи env ROMEO_WEBHOOK_HANDLER',
+      hint: 'Пример: /update-bot?handler=https://n8n.../webhook/romeo-openlines&bot_id=80198'
+    });
+  }
+
+  try {
+    const body = {
+      CODE: 'romeo',
+      ID: botId,
+      EVENT_MESSAGE_ADD: handler,
+      EVENT_WELCOME_MESSAGE: handler,
+      EVENT_BOT_DELETE: handler,
+      PROPERTIES: {
+        NAME: 'Romeo'
+      }
+    };
+    const r = await fetch(webhook + '/imbot.update.json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    res.json({
+      action: 'update-bot',
+      sent: body,
+      bitrix_response: data,
+      status: data.error ? 'error' : 'updated'
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -819,7 +924,7 @@ app.get('/messages', async (req, res) => {
       await new Promise(r => setTimeout(r, 200));
     }
     const result = { total_chats: chats.length, processed_chats: chatsWithMessages.length, byMonth, byStatus, sources, chats: chatsWithMessages, updatedAt: new Date().toISOString() };
-    cache[cacheKey] = result;
+    await setCache(cacheKey, result);
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
     res.json(result);
@@ -973,7 +1078,7 @@ app.get('/workday', async (req, res) => {
       timing: { first: firstActivity, last: lastActivity },
       updatedAt: new Date().toISOString()
     };
-    cache[cacheKey] = result;
+    await setCache(cacheKey, result);
     lastUpdate[cacheKey] = Date.now();
     loading[cacheKey] = false;
     res.json(result);
@@ -985,12 +1090,26 @@ app.get('/workday', async (req, res) => {
 
 app.get('/refresh', async (req, res) => {
   const key = req.query.key;
-  if (key) { delete cache[key]; delete lastUpdate[key]; res.json({ message: 'Cache cleared for ' + key }); }
-  else { cache = {}; lastUpdate = {}; res.json({ message: 'All cache cleared' }); }
+  if (key) { 
+    delete cache[key]; 
+    delete lastUpdate[key]; 
+    await pgDeleteCache(key);
+    res.json({ message: 'Cache cleared for ' + key }); 
+  } else { 
+    cache = {}; 
+    lastUpdate = {}; 
+    await pgClearAllCache();
+    res.json({ message: 'All cache cleared' }); 
+  }
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', cacheKeys: Object.keys(cache), loading: Object.keys(loading).filter(k => loading[k]) });
+  res.json({ 
+    status: 'ok', 
+    postgres: pgReady ? 'connected' : 'disabled',
+    cacheKeys: Object.keys(cache).length, 
+    loading: Object.keys(loading).filter(k => loading[k]).length
+  });
 });
 
 app.get('/proxy', async (req, res) => {
@@ -998,7 +1117,7 @@ app.get('/proxy', async (req, res) => {
   if (!url) return res.status(400).json({ error: 'url required' });
   try {
     const response = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+      headers: { 'User-Agent': 'Mozilla/5.0' },
       timeout: 30000
     });
     const text = await response.text();
@@ -1041,6 +1160,16 @@ app.post('/claude', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+// ============================================
+// STARTUP
+// ============================================
+app.listen(PORT, async () => {
   console.log('Bitrix Cache Server running on port', PORT);
+  if (pgReady) {
+    await initPgCache();
+    await pgLoadAllIntoMemory(cache);
+    console.log('✓ Postgres кэш загружен в память');
+  } else {
+    console.log('ℹ️ Postgres выключен — работаем в памяти (кэш очистится при перезапуске)');
+  }
 });
