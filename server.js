@@ -1208,6 +1208,36 @@ app.get('/probe-sessions', async (req, res) => {
       out.admin_recent = { count: items.length, byEntityType: et, sample: items.slice(0, 2) };
     } catch (e) { out.admin_recent = { error: String(e.message || e) }; }
 
+    // 3) на ОДНОЙ сессии открытой линии пробуем достать chat_id и прочитать сообщения
+    const olSample = acts.find(a => a.PROVIDER_ID === 'IMOPENLINES_SESSION');
+    if (olSample) {
+      const sessionId = olSample.ASSOCIATED_ENTITY_ID;
+      const userCode = (olSample.PROVIDER_PARAMS && olSample.PROVIDER_PARAMS.USER_CODE) || '';
+      const probe = { session_id: sessionId, user_code: userCode, tries: {} };
+      // a) imopenlines.session.get
+      try {
+        const r = await fetch(WEBHOOK + '/imopenlines.session.get.json?SESSION_ID=' + encodeURIComponent(sessionId), { timeout: 15000 });
+        probe.tries.session_get = await r.json();
+      } catch (e) { probe.tries.session_get = { error: String(e.message || e) }; }
+      // b) imopenlines.session.history.get (запасной)
+      try {
+        const r = await fetch(WEBHOOK + '/imopenlines.session.history.get.json?SESSION_ID=' + encodeURIComponent(sessionId), { timeout: 15000 });
+        probe.tries.session_history_get = await r.json();
+      } catch (e) { probe.tries.session_history_get = { error: String(e.message || e) }; }
+      // если получили chat_id — сразу читаем пару сообщений (проверка сквозного чтения)
+      const sg = probe.tries.session_get;
+      const chatId = sg && sg.result && (sg.result.CHAT_ID || sg.result.chat_id || (sg.result.session && (sg.result.session.CHAT_ID || sg.result.session.chat_id)));
+      if (chatId) {
+        probe.resolved_chat_id = chatId;
+        try {
+          const r = await fetch(WEBHOOK + '/im.dialog.messages.get.json?chat_id=' + chatId + '&limit=3', { timeout: 15000 });
+          const md = await r.json();
+          probe.tries.messages_sample = md && md.result ? (md.result.messages || []).slice(0, 3) : md;
+        } catch (e) { probe.tries.messages = { error: String(e.message || e) }; }
+      }
+      out.session_probe = probe;
+    }
+
     res.json(out);
   } catch (error) {
     res.status(500).json({ error: error.message });
