@@ -1402,7 +1402,8 @@ app.get('/workday2', async (req, res) => {
       };
     });
 
-    unanswered.sort((a, b) => String(b.time).localeCompare(String(a.time)));
+    unansweredDm.sort((a, b) => String(b.time).localeCompare(String(a.time)));
+    unansweredComments.sort((a, b) => String(b.time).localeCompare(String(a.time)));
 
     const result = {
       date, lookback_days: lookback,
