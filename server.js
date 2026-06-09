@@ -1026,6 +1026,16 @@ app.get('/workday', async (req, res) => {
       lastUpdate['messages_kash_500'] = Date.now();
     }
 
+    // классификатор автора сообщения
+    const ROMEO_IDS = [80198, 80100, 80098];
+    const classify = function (aid) {
+      const n = Number(aid);
+      if (n === MGR_ID) return 'MANAGER';
+      if (ROMEO_IDS.indexOf(n) !== -1) return 'ROMEO';
+      if (n === 0) return 'SYSTEM';
+      return 'CLIENT';
+    };
+
     let dayMessages = [];
     const dialogsByChat = {};
     if (msgCache && msgCache.chats) {
@@ -1033,37 +1043,63 @@ app.get('/workday', async (req, res) => {
         const chatDayMsgs = [];
         (chat.messages || []).forEach(m => {
           if (m.date && m.date.substring(0, 10) === date) {
+            const who = classify(m.author_id);
             dayMessages.push({
               chat: chat.title,
-              author_id: m.author_id,
+              author_id: Number(m.author_id),
+              who: who,
               text: (m.text || '').substring(0, 200),
               date: m.date,
               hour: parseInt(m.date.substring(11, 13))
             });
             chatDayMsgs.push({
-              who: Number(m.author_id) === MGR_ID ? 'MANAGER' : 'CLIENT',
+              who: who,
               text: (m.text || ''),
-              time: m.date.substring(11, 16)
+              time: m.date.substring(11, 16),
+              ts: Number(m.id) || 0
             });
           }
         });
         if (chatDayMsgs.length > 0) {
-          chatDayMsgs.sort((a, b) => a.time.localeCompare(b.time));
-          // ключ по id чата (не по названию) — иначе чаты с одинаковым именем схлопываются
-          dialogsByChat[chat.id || chat.title] = { title: chat.title, msgs: chatDayMsgs };
+          chatDayMsgs.sort((a, b) => a.ts - b.ts); // верный хронологический порядок по id сообщения
+          dialogsByChat[chat.id || chat.title] = { title: chat.title, id: chat.id, msgs: chatDayMsgs };
         }
       });
     }
 
-    const fullDialogs = Object.values(dialogsByChat)
+    // --- КЛАССИФИКАЦИЯ ЧАТОВ ЗА ДЕНЬ (по смыслу, не по шуму) ---
+    const cats = { live_manager: [], romeo_handled: [], client_waiting: [], outbound_only: [], system_only: [] };
+    Object.values(dialogsByChat).forEach(function (d) {
+      const real = d.msgs.filter(m => m.who !== 'SYSTEM'); // живые реплики без системных автозаписей
+      if (real.length === 0) { cats.system_only.push(d); return; } // только автозакрепление/переадресация — не диалог
+      const last = real[real.length - 1];
+      d.has_manager = real.some(m => m.who === 'MANAGER');
+      d.has_romeo = real.some(m => m.who === 'ROMEO');
+      d.last_who = last.who;
+      if (last.who === 'CLIENT') cats.client_waiting.push(d);   // клиент написал последним — ЖДЁТ ответа (горячий/провал)
+      else if (d.has_manager) cats.live_manager.push(d);        // менеджер реально вёл диалог
+      else if (d.has_romeo) cats.romeo_handled.push(d);         // вёл только бот
+      else cats.outbound_only.push(d);
+    });
+
+    // диалоги для показа — только живые (есть хоть одна несистемная реплика)
+    const realDialogs = Object.values(dialogsByChat).filter(d => d.msgs.some(m => m.who !== 'SYSTEM'));
+    const fullDialogs = realDialogs
       .sort((a, b) => b.msgs.length - a.msgs.length)
-      .slice(0, 300) // было 40 — теперь показываем все диалоги дня
-      .map(function(entry) {
-        const lines = entry.msgs.map(function(m) {
-          return '[' + m.time + '] ' + (m.who === 'MANAGER' ? 'МЕНЕДЖЕР' : 'КЛИЕНТ') + ': ' + m.text;
+      .slice(0, 300)
+      .map(function (entry) {
+        const lines = entry.msgs.filter(m => m.who !== 'SYSTEM').map(function (m) {
+          const tag = m.who === 'MANAGER' ? 'МЕНЕДЖЕР' : (m.who === 'ROMEO' ? 'ROMEO' : 'КЛИЕНТ');
+          return '[' + m.time + '] ' + tag + ': ' + m.text;
         });
-        return { client: entry.title, messages_count: entry.msgs.length, dialog: lines.join(NL) };
+        return { client: entry.title, messages_count: lines.length, last_who: entry.last_who, dialog: lines.join(NL) };
       });
+
+    // горячие без ответа — клиент написал последним, ответа нет
+    const unanswered = cats.client_waiting.map(function (d) {
+      const lastClient = d.msgs.filter(m => m.who === 'CLIENT').slice(-1)[0];
+      return { client: d.title, time: lastClient ? lastClient.time : '', last_message: lastClient ? lastClient.text.substring(0, 300) : '' };
+    });
 
     const tasksClosed = tasks.filter(t => t.closedDate && t.closedDate.substring(0,10) === date).length;
     const tasksCreated = tasks.filter(t => t.createdDate && t.createdDate.substring(0,10) === date).length;
@@ -1081,7 +1117,9 @@ app.get('/workday', async (req, res) => {
     });
 
     const msgByHour = {};
-    const managerDayMsgs = dayMessages.filter(m => Number(m.author_id) === MGR_ID);
+    const managerDayMsgs = dayMessages.filter(m => m.who === 'MANAGER');
+    const romeoDayMsgs = dayMessages.filter(m => m.who === 'ROMEO');
+    const clientDayMsgs = dayMessages.filter(m => m.who === 'CLIENT');
     managerDayMsgs.forEach(m => { msgByHour[m.hour] = (msgByHour[m.hour] || 0) + 1; });
 
     const allTimes = [].concat(
@@ -1095,7 +1133,25 @@ app.get('/workday', async (req, res) => {
       date,
       tasks: { total: tasks.length, closed: tasksClosed, created: tasksCreated, deadline: tasksDeadline, open: tasksOpen, overdue: tasksOverdue, list: tasks.slice(0, 50) },
       activities: { total: activities.length, completed: activities.filter(a => a.COMPLETED === 'Y').length, byHour: activityByHour, list: activities.slice(0, 50) },
-      messages: { total: dayMessages.length, manager: managerDayMsgs.length, client: dayMessages.filter(m => Number(m.author_id) !== MGR_ID && Number(m.author_id) !== 0).length, byHour: msgByHour, sample: managerDayMsgs.slice(0, 30), fullDialogs: fullDialogs },
+      messages: {
+        total: dayMessages.length,
+        manager: managerDayMsgs.length,
+        romeo: romeoDayMsgs.length,
+        client: clientDayMsgs.length,
+        system: dayMessages.filter(m => m.who === 'SYSTEM').length,
+        byHour: msgByHour,
+        sample: managerDayMsgs.slice(0, 30),
+        fullDialogs: fullDialogs
+      },
+      dialogs: {
+        total_real: realDialogs.length,        // живых диалогов (есть хоть одна несистемная реплика)
+        live_manager: cats.live_manager.length, // вёл менеджер
+        romeo_handled: cats.romeo_handled.length, // вёл только бот
+        client_waiting: cats.client_waiting.length, // клиент ждёт ответа (ГОРЯЧИЕ/провалы)
+        outbound_only: cats.outbound_only.length, // только исходящее, клиент не ответил
+        system_only: cats.system_only.length,   // только автозакрепления/переадресации (НЕ диалоги)
+        unanswered: unanswered                    // список горячих без ответа: кто, во сколько, последнее сообщение
+      },
       timing: { first: firstActivity, last: lastActivity },
       updatedAt: new Date().toISOString()
     };
