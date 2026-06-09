@@ -1165,6 +1165,55 @@ app.get('/workday', async (req, res) => {
   }
 });
 
+// ПРОБА (read-only): как достать ВСЕ сессии открытых линий через админ-вебхук.
+// Смотрим свежие активности CRM без фильтра по оператору — где провайдер открытых линий,
+// кто ответственный, и есть ли привязка к чату/диалогу. Сравниваем с recent.list админа.
+app.get('/probe-sessions', async (req, res) => {
+  try {
+    const out = {};
+
+    // 1) свежие активности CRM (админ, без фильтра по оператору)
+    const acts = [];
+    let start = 0;
+    for (let page = 0; page < 4 && acts.length < 80; page++) {
+      let url = WEBHOOK + '/crm.activity.list.json?order[CREATED]=desc';
+      ['ID', 'TYPE_ID', 'PROVIDER_ID', 'PROVIDER_TYPE_ID', 'PROVIDER_PARAMS', 'RESPONSIBLE_ID', 'AUTHOR_ID', 'OWNER_TYPE_ID', 'OWNER_ID', 'CREATED', 'SUBJECT', 'ASSOCIATED_ENTITY_ID', 'SETTINGS']
+        .forEach(f => { url += '&select[]=' + f; });
+      url += '&start=' + start;
+      let d = null;
+      try { const r = await fetch(url, { timeout: 15000 }); d = await r.json(); } catch (e) { out.activities_error = String(e.message || e); break; }
+      if (d && Array.isArray(d.result)) acts.push(...d.result);
+      const nextVal = d && d.next ? parseInt(d.next) : null;
+      if (nextVal && nextVal > start) start = nextVal; else break;
+      await new Promise(r2 => setTimeout(r2, 200));
+    }
+
+    const byProvider = {};
+    acts.forEach(a => { const p = a.PROVIDER_ID || 'none'; byProvider[p] = (byProvider[p] || 0) + 1; });
+    const samplesByProvider = {};
+    acts.forEach(a => {
+      const p = a.PROVIDER_ID || 'none';
+      if (!samplesByProvider[p]) samplesByProvider[p] = [];
+      if (samplesByProvider[p].length < 2) samplesByProvider[p].push(a); // по 2 сырых образца на провайдер
+    });
+    out.activities = { fetched: acts.length, byProvider, samplesByProvider };
+
+    // 2) im.recent.list от АДМИНА — сравнить охват (per-user scope)
+    try {
+      const rr = await fetch(WEBHOOK + '/im.recent.list.json?limit=50', { timeout: 15000 });
+      const rd = await rr.json();
+      const items = (rd.result && rd.result.items) || [];
+      const et = {};
+      items.forEach(it => { const e = it.entity_type || 'none'; et[e] = (et[e] || 0) + 1; });
+      out.admin_recent = { count: items.length, byEntityType: et, sample: items.slice(0, 2) };
+    } catch (e) { out.admin_recent = { error: String(e.message || e) }; }
+
+    res.json(out);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/refresh', async (req, res) => {
   const key = req.query.key;
   if (key) { 
