@@ -1244,6 +1244,163 @@ app.get('/probe-sessions', async (req, res) => {
   }
 });
 
+// НОВЫЙ отчёт по работе менеджеров — на основе СЕССИЙ открытых линий (админ-вебхук).
+// Видит ВСЕ линии всех операторов (не один recent.list). Разрез по каждому менеджеру.
+// Источник: crm.activity.list (PROVIDER_ID=IMOPENLINES_SESSION) -> imopenlines.session.history.get.
+app.get('/workday2', async (req, res) => {
+  const date = req.query.date || new Date().toISOString().substring(0, 10);
+  const lookback = Math.min(parseInt(req.query.lookback || '5', 10), 14);   // сколько дней назад искать стартовавшие сессии
+  const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
+  const cacheKey = 'workday2_' + date;
+  try {
+    const cached = cache[cacheKey];
+    const age = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
+    if (cached && age < 1800000 && !req.query.fresh) return res.json(cached);
+
+    const OPS = { '10': 'Алтанец', '20326': 'Кашинский', '73320': 'Самарина' };
+    const ROMEO_IDS = ['80198', '80100', '80098'];
+    const lookbackStr = new Date(new Date(date + 'T00:00:00').getTime() - lookback * 86400000).toISOString().substring(0, 10);
+
+    // 1) перечисляем сессии открытых линий за окно [date-lookback .. date]
+    const sessions = {};
+    let start = 0, guard = 0, stop = false;
+    while (!stop && guard < 80 && Object.keys(sessions).length < maxSessions) {
+      guard++;
+      let url = WEBHOOK + '/crm.activity.list.json?order[CREATED]=desc&filter[PROVIDER_ID]=IMOPENLINES_SESSION';
+      ['ID', 'PROVIDER_PARAMS', 'RESPONSIBLE_ID', 'AUTHOR_ID', 'OWNER_TYPE_ID', 'OWNER_ID', 'CREATED', 'SUBJECT', 'ASSOCIATED_ENTITY_ID']
+        .forEach(f => { url += '&select[]=' + f; });
+      url += '&start=' + start;
+      let d = null;
+      try { const r = await fetch(url, { timeout: 15000 }); d = await r.json(); } catch (e) { break; }
+      if (!d || !Array.isArray(d.result)) break;
+      for (const a of d.result) {
+        const created = (a.CREATED || '').substring(0, 10);
+        if (created < lookbackStr) { stop = true; break; }
+        const sid = a.ASSOCIATED_ENTITY_ID;
+        if (!sid || sessions[sid]) continue;
+        sessions[sid] = { sessionId: sid, responsible: String(a.RESPONSIBLE_ID || ''), subject: a.SUBJECT || '', created: a.CREATED || '' };
+      }
+      const nextVal = d.next ? parseInt(d.next, 10) : null;
+      if (!stop && nextVal && nextVal > start) start = nextVal; else stop = true;
+      await new Promise(r => setTimeout(r, 120));
+    }
+
+    // снятие служебной обёртки коннектора из текста
+    const strip = function (t) {
+      t = String(t || '').replace(/\[\/?[A-Za-z][^\]]*\]/g, ' ');
+      t = t.replace(/Ответ оператора\s*\([^)]*\)/gi, ' ');
+      t = t.replace(/(?:Instagram business|Whatsapp|Telegram(?:bot)?)\b.*?to JAG\s*\(channel id[^)]*\)/gi, ' ');
+      t = t.replace(/\bid\s+\d{6,}\b/gi, ' ');
+      return t.replace(/\s+/g, ' ').trim();
+    };
+
+    // 2) по каждой сессии тянем историю и классифицируем авторов
+    const sessIds = Object.keys(sessions);
+    for (const sid of sessIds) {
+      let hist = null;
+      try {
+        const r = await fetch(WEBHOOK + '/imopenlines.session.history.get.json?SESSION_ID=' + encodeURIComponent(sid), { timeout: 15000 });
+        hist = await r.json();
+      } catch (e) { sessions[sid].error = String(e.message || e); continue; }
+      const result = hist && hist.result;
+      if (!result || !result.message) { sessions[sid].error = (hist && hist.error) || 'no messages'; continue; }
+      const users = result.users || {};
+      const classify = function (senderid) {
+        const id = String(senderid || '0');
+        if (id === '0') return 'SYSTEM';
+        const u = users[id];
+        if (u && u.connector) return 'CLIENT';
+        if (u && u.bot) return 'ROMEO';
+        if (ROMEO_IDS.indexOf(id) !== -1) return 'ROMEO';
+        if (OPS[id]) return 'MANAGER';
+        return 'OPERATOR_OTHER'; // наша сторона, но id не в карте (возможно Роман/другой оператор)
+      };
+      const msgs = Object.values(result.message).map(function (m) {
+        return { id: Number(m.id) || 0, senderId: String(m.senderid || '0'), who: classify(m.senderid), date: m.date || '', day: (m.date || '').substring(0, 10), text: strip(m.text) };
+      }).filter(m => m.text || m.who !== 'SYSTEM');
+      msgs.sort((a, b) => a.id - b.id);
+      sessions[sid].chatId = result.chatId;
+      sessions[sid].messages = msgs;
+    }
+
+    // 3) агрегируем по каждому менеджеру за целевую дату
+    const managers = {};
+    const ensure = function (name) { if (!managers[name]) managers[name] = { messages: 0, sessions_active: {}, sessions_assigned: 0, first_resp_minutes: [] }; return managers[name]; };
+    ['Алтанец', 'Кашинский', 'Самарина', 'Ромео'].forEach(ensure);
+    const unknownOps = {};
+    const unanswered = [];
+    const altanetsGap = [];
+
+    Object.values(sessions).forEach(function (s) {
+      const msgs = s.messages || [];
+      const respName = OPS[s.responsible] || (ROMEO_IDS.indexOf(s.responsible) !== -1 ? 'Ромео' : null);
+      if (respName) ensure(respName).sessions_assigned++;
+
+      const dayMsgs = msgs.filter(m => m.day === date);
+      dayMsgs.forEach(function (m) {
+        let name = null;
+        if (m.who === 'MANAGER') name = OPS[m.senderId];
+        else if (m.who === 'ROMEO') name = 'Ромео';
+        else if (m.who === 'OPERATOR_OTHER') { unknownOps[m.senderId] = (unknownOps[m.senderId] || 0) + 1; }
+        if (name) { const mgr = ensure(name); mgr.messages++; mgr.sessions_active[s.sessionId] = true; }
+      });
+
+      // время до первого ответа (для сессии, где ответили в этот день)
+      const firstClient = msgs.find(m => m.who === 'CLIENT');
+      if (firstClient) {
+        const firstReply = msgs.find(m => m.id > firstClient.id && (m.who === 'MANAGER' || m.who === 'ROMEO'));
+        if (firstReply && firstReply.day === date && firstReply.date && firstClient.date) {
+          const mins = (new Date(firstReply.date) - new Date(firstClient.date)) / 60000;
+          const nm = firstReply.who === 'ROMEO' ? 'Ромео' : OPS[firstReply.senderId];
+          if (nm && mins >= 0) ensure(nm).first_resp_minutes.push(Math.round(mins));
+        }
+      }
+
+      // горячие без ответа: последняя несистемная реплика — от клиента
+      const real = msgs.filter(m => m.who !== 'SYSTEM');
+      if (real.length) {
+        const last = real[real.length - 1];
+        if (last.who === 'CLIENT') {
+          const rec = { client: s.subject, session: s.sessionId, assigned: respName || s.responsible, time: last.date, last_message: last.text.substring(0, 200) };
+          unanswered.push(rec);
+          if (String(s.responsible) === '10') altanetsGap.push(rec);
+        }
+      }
+    });
+
+    const managersOut = {};
+    Object.keys(managers).forEach(function (name) {
+      const m = managers[name];
+      const frm = m.first_resp_minutes;
+      managersOut[name] = {
+        messages_on_date: m.messages,
+        sessions_active_on_date: Object.keys(m.sessions_active).length,
+        sessions_assigned: m.sessions_assigned,
+        avg_first_response_min: frm.length ? Math.round(frm.reduce((a, b) => a + b, 0) / frm.length) : null,
+        responses_measured: frm.length
+      };
+    });
+
+    unanswered.sort((a, b) => String(b.time).localeCompare(String(a.time)));
+
+    const result = {
+      date, lookback_days: lookback,
+      sessions_scanned: sessIds.length,
+      managers: managersOut,
+      unmapped_operators: unknownOps,              // если тут есть id с сообщениями — это оператор, которого надо добавить в карту
+      unanswered_count: unanswered.length,
+      unanswered: unanswered.slice(0, 100),         // клиент ждёт ответа: кто, сессия, ответственный, время, последнее сообщение
+      altanets_gap: altanetsGap.slice(0, 50),       // сессии Алтанца (болеет) без ответа = провал перераспределения
+      updatedAt: new Date().toISOString()
+    };
+    cache[cacheKey] = result; lastUpdate[cacheKey] = Date.now();
+    await setCache(cacheKey, result);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/refresh', async (req, res) => {
   const key = req.query.key;
   if (key) { 
