@@ -1349,7 +1349,8 @@ app.get('/workday2', async (req, res) => {
     const ensure = function (name) { if (!managers[name]) managers[name] = { messages: 0, sessions_active: {}, sessions_assigned: 0, first_resp_minutes: [] }; return managers[name]; };
     ['Алтанец', 'Кашинский', 'Самарина', 'Ромео'].forEach(ensure);
     let unattributedReplies = 0;
-    const unanswered = [];
+    const unansweredDm = [];
+    const unansweredComments = [];
     const altanetsGap = [];
 
     Object.values(sessions).forEach(function (s) {
@@ -1363,23 +1364,27 @@ app.get('/workday2', async (req, res) => {
         else unattributedReplies++;
       });
 
-      // время до первого ответа (если ответили в этот день)
-      const firstClient = recs.find(r => r.kind === 'CLIENT');
-      if (firstClient) {
-        const firstReply = recs.find(r => r.id > firstClient.id && r.kind === 'OURSIDE');
-        if (firstReply && firstReply.day === date && firstReply.date && firstClient.date && firstReply.opName) {
-          const mins = (new Date(firstReply.date) - new Date(firstClient.date)) / 60000;
-          if (mins >= 0) ensure(firstReply.opName).first_resp_minutes.push(Math.round(mins));
+      // SLA: для сообщений клиента ЭТОГО дня — время до первого ответа в этот день
+      let pendingClient = null;
+      recs.forEach(function (r) {
+        if (r.kind === 'CLIENT') { pendingClient = r; }
+        else if (r.kind === 'OURSIDE') {
+          if (pendingClient && pendingClient.day === date && r.day === date && r.opName && r.date && pendingClient.date) {
+            const mins = (new Date(r.date) - new Date(pendingClient.date)) / 60000;
+            if (mins >= 0) ensure(r.opName).first_resp_minutes.push(Math.round(mins));
+          }
+          pendingClient = null;
         }
-      }
+      });
 
       // горячие без ответа: последняя реплика — от клиента
       if (recs.length) {
         const last = recs[recs.length - 1];
         if (last.kind === 'CLIENT') {
+          const isComment = /\(комментарии\)/.test(s.subject) || /^Комментарий к посту/.test(last.text);
           const rec = { client: s.subject, session: s.sessionId, assigned: respName || s.responsible, time: last.date, last_message: last.text.substring(0, 200) };
-          unanswered.push(rec);
-          if (String(s.responsible) === '10') altanetsGap.push(rec);
+          if (isComment) unansweredComments.push(rec); else unansweredDm.push(rec);
+          if (!isComment && String(s.responsible) === '10') altanetsGap.push(rec);
         }
       }
     });
@@ -1404,9 +1409,10 @@ app.get('/workday2', async (req, res) => {
       sessions_scanned: sessIds.length,
       managers: managersOut,
       unattributed_replies: unattributedReplies,   // наши ответы через коннектор, которых не удалось привязать к оператору
-      unanswered_count: unanswered.length,
-      unanswered: unanswered.slice(0, 100),         // клиент ждёт ответа: кто, сессия, ответственный, время, последнее сообщение
-      altanets_gap: altanetsGap.slice(0, 50),       // сессии Алтанца (болеет) без ответа = провал перераспределения
+      unanswered_dm_count: unansweredDm.length,     // реальные личные диалоги без ответа (горячие лиды)
+      unanswered_dm: unansweredDm.slice(0, 60),
+      unanswered_comments_count: unansweredComments.length, // комментарии/реакции под постами (НЕ горячие лиды)
+      altanets_gap: altanetsGap.slice(0, 50),       // личные диалоги Алтанца (болеет) без ответа
       updatedAt: new Date().toISOString()
     };
     cache[cacheKey] = result; lastUpdate[cacheKey] = Date.now();
