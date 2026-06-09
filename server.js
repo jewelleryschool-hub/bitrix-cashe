@@ -1245,16 +1245,10 @@ app.get('/probe-sessions', async (req, res) => {
 // НОВЫЙ отчёт по работе менеджеров — на основе СЕССИЙ открытых линий (админ-вебхук).
 // Видит ВСЕ линии всех операторов (не один recent.list). Разрез по каждому менеджеру.
 // Источник: crm.activity.list (PROVIDER_ID=IMOPENLINES_SESSION) -> imopenlines.session.history.get.
-app.get('/workday2', async (req, res) => {
-  const date = req.query.date || new Date().toISOString().substring(0, 10);
-  const lookback = Math.min(parseInt(req.query.lookback || '5', 10), 14);   // сколько дней назад искать стартовавшие сессии
-  const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
+// тяжёлый сбор отчёта — запускается в фоне (Битрикс отдаёт ~2 запроса/сек, 250 сессий = ~2 мин)
+async function computeWorkday2(date, lookback, maxSessions) {
   const cacheKey = 'workday2_' + date;
   try {
-    const cached = cache[cacheKey];
-    const age = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
-    if (cached && age < 1800000 && !req.query.fresh) return res.json(cached);
-
     const OPS = { '10': 'Алтанец', '20326': 'Кашинский', '73320': 'Самарина' };
     const ROMEO_IDS = ['80198', '80100', '80098'];
     const lookbackStr = new Date(new Date(date + 'T00:00:00').getTime() - lookback * 86400000).toISOString().substring(0, 10);
@@ -1292,56 +1286,55 @@ app.get('/workday2', async (req, res) => {
       return t.replace(/\s+/g, ' ').trim();
     };
 
-    // 2) по каждой сессии тянем историю и классифицируем авторов
+    // 2) по каждой сессии тянем историю и классифицируем авторов (параллельно, пачками — иначе таймаут)
     const sessIds = Object.keys(sessions);
-    for (const sid of sessIds) {
+    const opName = function (opId) {
+      if (!opId) return null;
+      const id = String(opId);
+      if (OPS[id]) return OPS[id];
+      if (ROMEO_IDS.indexOf(id) !== -1) return 'Ромео';
+      return null;
+    };
+    const opEventTarget = function (raw) {
+      if (/начал работу с диалогом/.test(raw)) { const m = raw.match(/\[USER=(\d+)/); return m ? m[1] : null; }
+      if (/(переадресовал диалог на|Обращение направлено на|перенаправлено на)/.test(raw)) { const m = raw.match(/на\s*\[USER=(\d+)/); return m ? m[1] : null; }
+      return null;
+    };
+    const processSession = async function (sid) {
       let hist = null;
       try {
         const r = await fetch(WEBHOOK + '/imopenlines.session.history.get.json?SESSION_ID=' + encodeURIComponent(sid), { timeout: 15000 });
         hist = await r.json();
-      } catch (e) { sessions[sid].error = String(e.message || e); continue; }
+      } catch (e) { sessions[sid].error = String(e.message || e); return; }
       const result = hist && hist.result;
-      if (!result || !result.message) { sessions[sid].error = (hist && hist.error) || 'no messages'; continue; }
+      if (!result || !result.message) { sessions[sid].error = (hist && hist.error) || 'no messages'; return; }
       const users = result.users || {};
-      const opName = function (opId) {
-        if (!opId) return null;
-        const id = String(opId);
-        if (OPS[id]) return OPS[id];
-        if (ROMEO_IDS.indexOf(id) !== -1) return 'Ромео';
-        return null; // оператор не из карты
-      };
-      // id оператора из системной строки назначения/перевода
-      const opEventTarget = function (raw) {
-        if (/начал работу с диалогом/.test(raw)) { const m = raw.match(/\[USER=(\d+)/); return m ? m[1] : null; }
-        if (/(переадресовал диалог на|Обращение направлено на|перенаправлено на)/.test(raw)) { const m = raw.match(/на\s*\[USER=(\d+)/); return m ? m[1] : null; }
-        return null;
-      };
       const rawMsgs = Object.values(result.message).sort(function (a, b) { return Number(a.id) - Number(b.id); });
-      let currentOp = String(sessions[sid].responsible || '') || null; // стартовый ответственный
+      let currentOp = String(sessions[sid].responsible || '') || null;
       const records = [];
-      let unattributed = 0;
       for (const m of rawMsgs) {
         const senderId = String(m.senderid || '0');
         const raw = String(m.text || '');
-        if (senderId === '0') { const t = opEventTarget(raw); if (t) currentOp = t; continue; } // системное → обновляем оператора
+        if (senderId === '0') { const t = opEventTarget(raw); if (t) currentOp = t; continue; }
         const u = users[senderId] || {};
-        // Pact записывает наши исходящие под connector-юзером клиента с префиксом «Ответ оператора»
         const isOutboundEcho = /^\s*(?:\[[^\]]*\]\s*)?Ответ оператора/i.test(raw);
         let kind, opId = null;
         if (u.connector) {
-          if (isOutboundEcho) { kind = 'OURSIDE'; opId = currentOp; } // наш ответ через коннектор
-          else { kind = 'CLIENT'; }                                   // входящее клиента
+          if (isOutboundEcho) { kind = 'OURSIDE'; opId = currentOp; }
+          else { kind = 'CLIENT'; }
         } else if (u.bot || ROMEO_IDS.indexOf(senderId) !== -1) { kind = 'OURSIDE'; opId = senderId; currentOp = senderId; }
-        else { kind = 'OURSIDE'; opId = senderId; currentOp = senderId; } // живой оператор под своим id
+        else { kind = 'OURSIDE'; opId = senderId; currentOp = senderId; }
         const text = strip(raw);
-        if (!text) continue; // пропускаем пустые (конверты коннектора)
-        const nm = kind === 'OURSIDE' ? opName(opId) : null;
-        if (kind === 'OURSIDE' && !nm) unattributed++;
-        records.push({ id: Number(m.id) || 0, date: m.date || '', day: (m.date || '').substring(0, 10), kind: kind, opName: nm, text: text });
+        if (!text) continue;
+        records.push({ id: Number(m.id) || 0, date: m.date || '', day: (m.date || '').substring(0, 10), kind: kind, opName: kind === 'OURSIDE' ? opName(opId) : null, text: text });
       }
       sessions[sid].chatId = result.chatId;
       sessions[sid].records = records;
-      sessions[sid].unattributed = unattributed;
+    };
+    const BATCH = 4;
+    for (let i = 0; i < sessIds.length; i += BATCH) {
+      await Promise.all(sessIds.slice(i, i + BATCH).map(processSession));
+      await new Promise(function (r) { setTimeout(r, 700); }); // щадим лимит Битрикса (~2-3 запроса/сек), чтобы не ловить throttle
     }
 
     // 3) агрегируем по каждому менеджеру за целевую дату
@@ -1418,10 +1411,29 @@ app.get('/workday2', async (req, res) => {
     };
     cache[cacheKey] = result; lastUpdate[cacheKey] = Date.now();
     await setCache(cacheKey, result);
-    res.json(result);
+    return result;
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    throw error;
   }
+}
+
+app.get('/workday2', async (req, res) => {
+  const date = req.query.date || new Date().toISOString().substring(0, 10);
+  const lookback = Math.min(parseInt(req.query.lookback || '2', 10), 14);    // по умолчанию 2 дня — быстрее
+  const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
+  const cacheKey = 'workday2_' + date;
+  const cached = cache[cacheKey];
+  const age = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
+  if (cached && age < 1800000 && !req.query.fresh) return res.json(cached);
+  // уже собирается в фоне
+  if (loading[cacheKey]) return res.json({ status: 'building', message: 'Отчёт собирается, обнови через 1–2 мин', date: date });
+  // запускаем фоновый сбор и НЕ ждём его (иначе таймаут прокси)
+  loading[cacheKey] = true;
+  computeWorkday2(date, lookback, maxSessions)
+    .then(function () { loading[cacheKey] = false; })
+    .catch(function (e) { loading[cacheKey] = false; cache[cacheKey + '_error'] = { error: String((e && e.message) || e), at: new Date().toISOString() }; });
+  if (cached) return res.json(Object.assign({ status: 'rebuilding_in_background', note: 'Это прошлые данные; свежие соберутся через 1–2 мин — обнови.' }, cached));
+  return res.json({ status: 'building', message: 'Отчёт собирается впервые (~1–2 мин, лимит Битрикса ~2 запроса/сек). Обнови через 1–2 минуты.', date: date, lookback: lookback });
 });
 
 app.get('/refresh', async (req, res) => {
