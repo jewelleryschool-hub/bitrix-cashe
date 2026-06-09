@@ -1247,7 +1247,7 @@ app.get('/probe-sessions', async (req, res) => {
 // Источник: crm.activity.list (PROVIDER_ID=IMOPENLINES_SESSION) -> imopenlines.session.history.get.
 // тяжёлый сбор отчёта — запускается в фоне (Битрикс отдаёт ~2 запроса/сек, 250 сессий = ~2 мин)
 async function computeWorkday2(date, lookback, maxSessions) {
-  const cacheKey = 'workday2_' + date;
+  const cacheKey = wd2Key(date, lookback);
   try {
     const OPS = { '10': 'Алтанец', '20326': 'Кашинский', '73320': 'Самарина' };
     const ROMEO_IDS = ['80198', '80100', '80098'];
@@ -1375,7 +1375,7 @@ async function computeWorkday2(date, lookback, maxSessions) {
         const last = recs[recs.length - 1];
         if (last.kind === 'CLIENT') {
           const isComment = /\(комментарии\)/.test(s.subject) || /^Комментарий к посту/.test(last.text);
-          const rec = { client: s.subject, session: s.sessionId, assigned: respName || s.responsible, time: last.date, last_message: last.text.substring(0, 200) };
+          const rec = { client: s.subject, session: s.sessionId, chatId: s.chatId || null, assigned: respName || s.responsible, time: last.date, last_message: last.text.substring(0, 200) };
           if (isComment) unansweredComments.push(rec); else unansweredDm.push(rec);
           if (!isComment && String(s.responsible) === '10') altanetsGap.push(rec);
         }
@@ -1421,7 +1421,7 @@ app.get('/workday2', async (req, res) => {
   const date = req.query.date || new Date().toISOString().substring(0, 10);
   const lookback = Math.min(parseInt(req.query.lookback || '2', 10), 14);    // по умолчанию 2 дня — быстрее
   const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
-  const cacheKey = 'workday2_' + date;
+  const cacheKey = wd2Key(date, lookback);
   const cached = cache[cacheKey];
   const age = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
   if (cached && age < 1800000 && !req.query.fresh) return res.json(cached);
@@ -1434,6 +1434,183 @@ app.get('/workday2', async (req, res) => {
     .catch(function (e) { loading[cacheKey] = false; cache[cacheKey + '_error'] = { error: String((e && e.message) || e), at: new Date().toISOString() }; });
   if (cached) return res.json(Object.assign({ status: 'rebuilding_in_background', note: 'Это прошлые данные; свежие соберутся через 1–2 мин — обнови.' }, cached));
   return res.json({ status: 'building', message: 'Отчёт собирается впервые (~1–2 мин, лимит Битрикса ~2 запроса/сек). Обнови через 1–2 минуты.', date: date, lookback: lookback });
+});
+
+// ===== ЧИТАЕМЫЙ ЕЖЕДНЕВНЫЙ ОТЧЁТ (HTML) =====
+const WD2_MGR_ID = { 'Алтанец': '10', 'Кашинский': '20326', 'Самарина': '73320', 'Ромео': '80198' };
+function wd2Key(date, lookback) { return 'workday2_' + date + '_lb' + lookback; }
+function wd2Esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function wd2Name(subj) { const m = String(subj || '').match(/"([^"]+)"/); return m ? m[1] : String(subj || ''); }
+function wd2Time(t) { const s = String(t || ''); return s.length >= 16 ? (s.substring(11, 16) + ' · ' + s.substring(8, 10) + '.' + s.substring(5, 7)) : s; }
+function wd2Channel(subj) {
+  const s = String(subj || '');
+  if (/ВКонтакте|VK/.test(s)) return 'VK';
+  if (/Instagram/.test(s)) return 'Instagram';
+  if (/Whatsapp|WhatsApp/i.test(s)) return 'WhatsApp';
+  if (/Telegram/i.test(s)) return 'Telegram';
+  return 'OL';
+}
+const WD2_CSS = '<style>' +
+  ':root{--bg:#f6f7f9;--card:#fff;--line:#e8eaed;--txt:#1d2129;--mut:#8a9099;--red:#e5484d;--grn:#2da44e;--blue:#2563eb}' +
+  '*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:18px;line-height:1.45}' +
+  '.wrap{max-width:900px;margin:0 auto}h1{font-size:20px;margin:0 0 2px}h2{font-size:15px;margin:24px 0 10px;color:var(--txt)}' +
+  '.sub{color:var(--mut);font-size:13px;margin-bottom:14px}' +
+  '.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0 14px}' +
+  '.toolbar a,.toolbar button{font:inherit;font-size:13px;text-decoration:none;color:var(--txt);background:var(--card);border:1px solid var(--line);padding:6px 12px;border-radius:8px;cursor:pointer}' +
+  '.toolbar a.primary{background:var(--blue);color:#fff;border-color:var(--blue)}' +
+  '.toolbar a.win.on{background:var(--txt);color:#fff;border-color:var(--txt)}' +
+  '.winlbl{color:var(--mut);font-size:13px}' +
+  'input[type=date]{font:inherit;font-size:13px;padding:5px 8px;border:1px solid var(--line);border-radius:8px;background:var(--card)}' +
+  'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}' +
+  'th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:14px}th{font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.03em}' +
+  'tr:last-child td{border-bottom:none}td.nm{font-weight:600}td.nm a{color:var(--blue);text-decoration:none}td.nm a:hover{text-decoration:underline}td.muted{color:var(--mut)}' +
+  '.lead{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--mut);border-radius:9px;padding:10px 13px;margin-bottom:8px}' +
+  '.lead.hot{border-left-color:var(--red)}.lead.cool{border-left-color:#c9ced6}' +
+  '.lead-h{display:flex;justify-content:space-between;gap:10px;align-items:baseline;flex-wrap:wrap}' +
+  '.lead-name{font-weight:600;font-size:14px}.lead-name a{color:var(--blue);text-decoration:none}.lead-name a:hover{text-decoration:underline}' +
+  '.lead-meta{color:var(--mut);font-size:12px;white-space:nowrap}' +
+  '.chip{background:#eef1f4;color:#5b6470;border-radius:5px;padding:1px 6px;font-size:11px}' +
+  '.lead-msg{color:#3a3f47;font-size:13px;margin-top:4px}' +
+  '.empty{color:var(--mut);background:var(--card);border:1px dashed var(--line);border-radius:9px;padding:14px;text-align:center}' +
+  '.banner{background:#fff7e6;border:1px solid #ffe1a8;color:#7a5b00;padding:9px 12px;border-radius:8px;font-size:13px;margin-bottom:14px}' +
+  '.cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:6px}.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 14px;flex:1;min-width:110px}' +
+  '.kpi .n{font-size:22px;font-weight:700}.kpi .l{font-size:12px;color:var(--mut)}' +
+  'footer{color:var(--mut);font-size:12px;margin-top:26px}a.back{color:var(--blue);text-decoration:none;font-size:13px}' +
+  '</style>';
+function wd2WinSelector(basePath, date, lb) {
+  const sep = basePath.indexOf('?') !== -1 ? '&' : '?';
+  const b = function (n, label) { return '<a class="win' + (lb === n ? ' on' : '') + '" href="' + basePath + sep + 'date=' + date + '&lookback=' + n + '">' + label + '</a>'; };
+  return '<div class="toolbar"><span class="winlbl">Окно:</span>' + b(2, '2 дня') + b(7, 'неделя') + b(14, '2 недели') + '</div>';
+}
+function wd2LeadCard(r) {
+  const link = r.chatId ? ('https://b24-99blai.bitrix24.ru/online/?IM_HISTORY=imol|' + r.chatId) : null;
+  const nm = wd2Esc(wd2Name(r.client));
+  const title = link ? ('<a href="' + link + '" target="_blank">' + nm + '</a>') : nm;
+  const hot = String(r.last_message || '').length > 40;
+  return '<div class="lead ' + (hot ? 'hot' : 'cool') + '">' +
+    '<div class="lead-h"><span class="lead-name">' + title + '</span>' +
+    '<span class="lead-meta"><span class="chip">' + wd2Channel(r.client) + '</span> ' + wd2Esc(r.assigned) + ' · ' + wd2Time(r.time) + '</span></div>' +
+    '<div class="lead-msg">' + wd2Esc(r.last_message) + '</div></div>';
+}
+function renderWorkday2Html(d, rebuilding) {
+  const lb = d.lookback_days;
+  const order = ['Ромео', 'Кашинский', 'Самарина', 'Алтанец'];
+  const names = order.filter(function (n) { return d.managers[n]; })
+    .concat(Object.keys(d.managers).filter(function (n) { return order.indexOf(n) === -1; }));
+  const rows = names.map(function (n) {
+    const m = d.managers[n];
+    const sla = m.avg_first_response_min == null ? '—' : (m.avg_first_response_min + ' мин');
+    const mlink = '/report/manager?name=' + encodeURIComponent(n) + '&date=' + d.date + '&lookback=' + lb;
+    return '<tr><td class="nm"><a href="' + mlink + '">' + wd2Esc(n) + '</a></td><td>' + m.messages_on_date + '</td><td>' + m.sessions_active_on_date + '</td><td>' + m.sessions_assigned + '</td><td>' + sla + '</td><td class="muted">' + m.responses_measured + '</td></tr>';
+  }).join('');
+  const dm = (d.unanswered_dm || []).map(wd2LeadCard).join('') || '<div class="empty">Нет диалогов, где клиент ждёт ответа 🎉</div>';
+  const gap = (d.altanets_gap || []).length
+    ? '<h2>Висит на Алтанце (болеет) — перераздать</h2>' + (d.altanets_gap || []).map(wd2LeadCard).join('')
+    : '';
+  const banner = rebuilding ? '<div class="banner">Идёт пересчёт свежих данных в фоне — обнови страницу через минуту.</div>' : '';
+  const today = new Date().toISOString().substring(0, 10);
+  const yest = new Date(new Date(d.date + 'T00:00:00').getTime() - 86400000).toISOString().substring(0, 10);
+  const tom = new Date(new Date(d.date + 'T00:00:00').getTime() + 86400000).toISOString().substring(0, 10);
+  return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Отчёт ' + wd2Esc(d.date) + '</title>' + WD2_CSS + '</head><body><div class="wrap">' +
+    '<h1>Ежедневный отчёт отдела продаж</h1>' +
+    '<div class="sub">' + wd2Esc(d.date) + ' · сессий: ' + d.sessions_scanned + ' · окно ' + lb + ' дн. · обновлено ' + wd2Esc(String(d.updatedAt || '').substring(11, 16)) + ' UTC</div>' +
+    banner +
+    '<form class="toolbar" method="get" action="/report">' +
+    '<a href="/report?date=' + yest + '&lookback=' + lb + '">← ' + yest + '</a>' +
+    '<input type="date" name="date" value="' + wd2Esc(d.date) + '">' +
+    '<input type="hidden" name="lookback" value="' + lb + '">' +
+    '<button type="submit">Показать</button>' +
+    (d.date < today ? '<a href="/report?date=' + tom + '&lookback=' + lb + '">' + tom + ' →</a>' : '') +
+    '<a class="primary" href="/report?date=' + wd2Esc(d.date) + '&lookback=' + lb + '&fresh=1">↻ Свежий пересчёт</a>' +
+    '</form>' +
+    wd2WinSelector('/report', wd2Esc(d.date), lb) +
+    '<div class="cards">' +
+    '<div class="kpi"><div class="n">' + (d.unanswered_dm_count || 0) + '</div><div class="l">диалогов ждут ответа</div></div>' +
+    '<div class="kpi"><div class="n">' + (d.unanswered_comments_count || 0) + '</div><div class="l">комментариев (не лиды)</div></div>' +
+    '<div class="kpi"><div class="n">' + (d.unattributed_replies || 0) + '</div><div class="l">ответов без привязки</div></div>' +
+    '</div>' +
+    '<h2>По менеджерам</h2>' +
+    '<div class="sub" style="margin-top:-4px">Кликни по имени — откроется отдельная страница менеджера.</div>' +
+    '<table><thead><tr><th>Менеджер</th><th>Сообщений</th><th>Активных сессий</th><th>Назначено</th><th>Ср. первый ответ</th><th>Замеров</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    '<h2>Клиенты ждут ответа (' + (d.unanswered_dm_count || 0) + ')</h2>' +
+    '<div class="sub" style="margin-top:-4px">Красная полоса — содержательное сообщение (вероятно горячий лид). Имя кликабельно → открывает чат в Битриксе.</div>' +
+    dm +
+    gap +
+    '<footer>Источник: открытые линии Битрикс24. «Назначено» = сессии, стартовавшие за окно. SLA первого ответа — по сообщениям клиента за этот день.</footer>' +
+    '</div></body></html>';
+}
+function renderManagerHtml(d, name) {
+  const lb = d.lookback_days;
+  const back = '/report?date=' + d.date + '&lookback=' + lb;
+  const m = d.managers[name];
+  if (!m) {
+    return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + wd2Esc(name) + '</title>' + WD2_CSS + '</head><body><div class="wrap"><a class="back" href="' + back + '">← к отчёту</a><h1>' + wd2Esc(name) + '</h1><div class="empty">Нет данных за ' + wd2Esc(d.date) + ' (окно ' + lb + ' дн.).</div></div></body></html>';
+  }
+  const uid = WD2_MGR_ID[name];
+  const profile = uid ? ('https://b24-99blai.bitrix24.ru/company/personal/user/' + uid + '/') : null;
+  const waiting = (d.unanswered_dm || []).filter(function (r) { return String(r.assigned) === name; });
+  const dm = waiting.map(wd2LeadCard).join('') || '<div class="empty">Никто не ждёт ответа 🎉</div>';
+  const sla = m.avg_first_response_min == null ? '—' : (m.avg_first_response_min + ' мин');
+  return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>' + wd2Esc(name) + ' · ' + wd2Esc(d.date) + '</title>' + WD2_CSS + '</head><body><div class="wrap">' +
+    '<a class="back" href="' + back + '">← ко всему отчёту</a>' +
+    '<h1>' + wd2Esc(name) + '</h1>' +
+    '<div class="sub">' + wd2Esc(d.date) + ' · окно ' + lb + ' дн.' + (profile ? ' · <a class="back" href="' + profile + '" target="_blank">профиль в Битриксе ↗</a>' : '') + '</div>' +
+    wd2WinSelector('/report/manager?name=' + encodeURIComponent(name), wd2Esc(d.date), lb) +
+    '<div class="cards">' +
+    '<div class="kpi"><div class="n">' + m.messages_on_date + '</div><div class="l">сообщений за день</div></div>' +
+    '<div class="kpi"><div class="n">' + m.sessions_active_on_date + '</div><div class="l">активных сессий</div></div>' +
+    '<div class="kpi"><div class="n">' + m.sessions_assigned + '</div><div class="l">назначено за окно</div></div>' +
+    '<div class="kpi"><div class="n">' + sla + '</div><div class="l">ср. первый ответ</div></div>' +
+    '<div class="kpi"><div class="n">' + waiting.length + '</div><div class="l">ждут его ответа</div></div>' +
+    '</div>' +
+    '<h2>Клиенты ждут ответа от «' + wd2Esc(name) + '» (' + waiting.length + ')</h2>' +
+    dm +
+    '</div></body></html>';
+}
+function renderBuildingHtml(date) {
+  return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<meta http-equiv="refresh" content="15"><title>Собираю отчёт…</title><style>' +
+    'body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f6f7f9;color:#1d2129;display:flex;height:100vh;margin:0;align-items:center;justify-content:center;text-align:center}' +
+    '.box{max-width:420px;padding:24px}.sp{width:34px;height:34px;border:3px solid #e8eaed;border-top-color:#2563eb;border-radius:50%;margin:0 auto 16px;animation:s 1s linear infinite}@keyframes s{to{transform:rotate(360deg)}}' +
+    'h1{font-size:18px;margin:0 0 8px}p{color:#8a9099;font-size:14px;margin:0}</style></head><body><div class="box"><div class="sp"></div>' +
+    '<h1>Собираю отчёт за ' + wd2Esc(date) + '…</h1><p>Это ~1–2 минуты (лимит Битрикса ~2 запроса/сек). Страница обновится сама.</p></div></body></html>';
+}
+
+function wd2EnsureBuild(date, lookback, maxSessions, wantFresh) {
+  const cacheKey = wd2Key(date, lookback);
+  const age = lastUpdate[cacheKey] ? Date.now() - lastUpdate[cacheKey] : Infinity;
+  if ((!cache[cacheKey] || (wantFresh && age > 5000)) && !loading[cacheKey]) {
+    loading[cacheKey] = true;
+    computeWorkday2(date, lookback, maxSessions)
+      .then(function () { loading[cacheKey] = false; })
+      .catch(function (e) { loading[cacheKey] = false; cache[cacheKey + '_error'] = { error: String((e && e.message) || e), at: new Date().toISOString() }; });
+  }
+  return cacheKey;
+}
+
+app.get('/report', async (req, res) => {
+  const date = req.query.date || new Date().toISOString().substring(0, 10);
+  const lookback = Math.min(parseInt(req.query.lookback || '2', 10), 14);
+  const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
+  const wantFresh = !!req.query.fresh;
+  const cacheKey = wd2EnsureBuild(date, lookback, maxSessions, wantFresh);
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  if (cache[cacheKey]) return res.send(renderWorkday2Html(cache[cacheKey], wantFresh || !!loading[cacheKey]));
+  return res.send(renderBuildingHtml(date));
+});
+
+app.get('/report/manager', async (req, res) => {
+  const name = String(req.query.name || '');
+  const date = req.query.date || new Date().toISOString().substring(0, 10);
+  const lookback = Math.min(parseInt(req.query.lookback || '2', 10), 14);
+  const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
+  const wantFresh = !!req.query.fresh;
+  const cacheKey = wd2EnsureBuild(date, lookback, maxSessions, wantFresh);
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  if (cache[cacheKey]) return res.send(renderManagerHtml(cache[cacheKey], name));
+  return res.send(renderBuildingHtml(date));
 });
 
 app.get('/refresh', async (req, res) => {
