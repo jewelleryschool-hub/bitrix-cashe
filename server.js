@@ -1303,62 +1303,80 @@ app.get('/workday2', async (req, res) => {
       const result = hist && hist.result;
       if (!result || !result.message) { sessions[sid].error = (hist && hist.error) || 'no messages'; continue; }
       const users = result.users || {};
-      const classify = function (senderid) {
-        const id = String(senderid || '0');
-        if (id === '0') return 'SYSTEM';
-        const u = users[id];
-        if (u && u.connector) return 'CLIENT';
-        if (u && u.bot) return 'ROMEO';
-        if (ROMEO_IDS.indexOf(id) !== -1) return 'ROMEO';
-        if (OPS[id]) return 'MANAGER';
-        return 'OPERATOR_OTHER'; // наша сторона, но id не в карте (возможно Роман/другой оператор)
+      const opName = function (opId) {
+        if (!opId) return null;
+        const id = String(opId);
+        if (OPS[id]) return OPS[id];
+        if (ROMEO_IDS.indexOf(id) !== -1) return 'Ромео';
+        return null; // оператор не из карты
       };
-      const msgs = Object.values(result.message).map(function (m) {
-        return { id: Number(m.id) || 0, senderId: String(m.senderid || '0'), who: classify(m.senderid), date: m.date || '', day: (m.date || '').substring(0, 10), text: strip(m.text) };
-      }).filter(m => m.text || m.who !== 'SYSTEM');
-      msgs.sort((a, b) => a.id - b.id);
+      // id оператора из системной строки назначения/перевода
+      const opEventTarget = function (raw) {
+        if (/начал работу с диалогом/.test(raw)) { const m = raw.match(/\[USER=(\d+)/); return m ? m[1] : null; }
+        if (/(переадресовал диалог на|Обращение направлено на|перенаправлено на)/.test(raw)) { const m = raw.match(/на\s*\[USER=(\d+)/); return m ? m[1] : null; }
+        return null;
+      };
+      const rawMsgs = Object.values(result.message).sort(function (a, b) { return Number(a.id) - Number(b.id); });
+      let currentOp = String(sessions[sid].responsible || '') || null; // стартовый ответственный
+      const records = [];
+      let unattributed = 0;
+      for (const m of rawMsgs) {
+        const senderId = String(m.senderid || '0');
+        const raw = String(m.text || '');
+        if (senderId === '0') { const t = opEventTarget(raw); if (t) currentOp = t; continue; } // системное → обновляем оператора
+        const u = users[senderId] || {};
+        // Pact записывает наши исходящие под connector-юзером клиента с префиксом «Ответ оператора»
+        const isOutboundEcho = /^\s*(?:\[[^\]]*\]\s*)?Ответ оператора/i.test(raw);
+        let kind, opId = null;
+        if (u.connector) {
+          if (isOutboundEcho) { kind = 'OURSIDE'; opId = currentOp; } // наш ответ через коннектор
+          else { kind = 'CLIENT'; }                                   // входящее клиента
+        } else if (u.bot || ROMEO_IDS.indexOf(senderId) !== -1) { kind = 'OURSIDE'; opId = senderId; currentOp = senderId; }
+        else { kind = 'OURSIDE'; opId = senderId; currentOp = senderId; } // живой оператор под своим id
+        const text = strip(raw);
+        if (!text) continue; // пропускаем пустые (конверты коннектора)
+        const nm = kind === 'OURSIDE' ? opName(opId) : null;
+        if (kind === 'OURSIDE' && !nm) unattributed++;
+        records.push({ id: Number(m.id) || 0, date: m.date || '', day: (m.date || '').substring(0, 10), kind: kind, opName: nm, text: text });
+      }
       sessions[sid].chatId = result.chatId;
-      sessions[sid].messages = msgs;
+      sessions[sid].records = records;
+      sessions[sid].unattributed = unattributed;
     }
 
     // 3) агрегируем по каждому менеджеру за целевую дату
     const managers = {};
     const ensure = function (name) { if (!managers[name]) managers[name] = { messages: 0, sessions_active: {}, sessions_assigned: 0, first_resp_minutes: [] }; return managers[name]; };
     ['Алтанец', 'Кашинский', 'Самарина', 'Ромео'].forEach(ensure);
-    const unknownOps = {};
+    let unattributedReplies = 0;
     const unanswered = [];
     const altanetsGap = [];
 
     Object.values(sessions).forEach(function (s) {
-      const msgs = s.messages || [];
+      const recs = s.records || [];
       const respName = OPS[s.responsible] || (ROMEO_IDS.indexOf(s.responsible) !== -1 ? 'Ромео' : null);
       if (respName) ensure(respName).sessions_assigned++;
 
-      const dayMsgs = msgs.filter(m => m.day === date);
-      dayMsgs.forEach(function (m) {
-        let name = null;
-        if (m.who === 'MANAGER') name = OPS[m.senderId];
-        else if (m.who === 'ROMEO') name = 'Ромео';
-        else if (m.who === 'OPERATOR_OTHER') { unknownOps[m.senderId] = (unknownOps[m.senderId] || 0) + 1; }
-        if (name) { const mgr = ensure(name); mgr.messages++; mgr.sessions_active[s.sessionId] = true; }
+      // сообщения нашей стороны за дату, привязанные к менеджеру
+      recs.filter(r => r.day === date && r.kind === 'OURSIDE').forEach(function (r) {
+        if (r.opName) { const mgr = ensure(r.opName); mgr.messages++; mgr.sessions_active[s.sessionId] = true; }
+        else unattributedReplies++;
       });
 
-      // время до первого ответа (для сессии, где ответили в этот день)
-      const firstClient = msgs.find(m => m.who === 'CLIENT');
+      // время до первого ответа (если ответили в этот день)
+      const firstClient = recs.find(r => r.kind === 'CLIENT');
       if (firstClient) {
-        const firstReply = msgs.find(m => m.id > firstClient.id && (m.who === 'MANAGER' || m.who === 'ROMEO'));
-        if (firstReply && firstReply.day === date && firstReply.date && firstClient.date) {
+        const firstReply = recs.find(r => r.id > firstClient.id && r.kind === 'OURSIDE');
+        if (firstReply && firstReply.day === date && firstReply.date && firstClient.date && firstReply.opName) {
           const mins = (new Date(firstReply.date) - new Date(firstClient.date)) / 60000;
-          const nm = firstReply.who === 'ROMEO' ? 'Ромео' : OPS[firstReply.senderId];
-          if (nm && mins >= 0) ensure(nm).first_resp_minutes.push(Math.round(mins));
+          if (mins >= 0) ensure(firstReply.opName).first_resp_minutes.push(Math.round(mins));
         }
       }
 
-      // горячие без ответа: последняя несистемная реплика — от клиента
-      const real = msgs.filter(m => m.who !== 'SYSTEM');
-      if (real.length) {
-        const last = real[real.length - 1];
-        if (last.who === 'CLIENT') {
+      // горячие без ответа: последняя реплика — от клиента
+      if (recs.length) {
+        const last = recs[recs.length - 1];
+        if (last.kind === 'CLIENT') {
           const rec = { client: s.subject, session: s.sessionId, assigned: respName || s.responsible, time: last.date, last_message: last.text.substring(0, 200) };
           unanswered.push(rec);
           if (String(s.responsible) === '10') altanetsGap.push(rec);
@@ -1385,7 +1403,7 @@ app.get('/workday2', async (req, res) => {
       date, lookback_days: lookback,
       sessions_scanned: sessIds.length,
       managers: managersOut,
-      unmapped_operators: unknownOps,              // если тут есть id с сообщениями — это оператор, которого надо добавить в карту
+      unattributed_replies: unattributedReplies,   // наши ответы через коннектор, которых не удалось привязать к оператору
       unanswered_count: unanswered.length,
       unanswered: unanswered.slice(0, 100),         // клиент ждёт ответа: кто, сессия, ответственный, время, последнее сообщение
       altanets_gap: altanetsGap.slice(0, 50),       // сессии Алтанца (болеет) без ответа = провал перераспределения
