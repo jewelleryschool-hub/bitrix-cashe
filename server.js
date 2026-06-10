@@ -1613,6 +1613,31 @@ app.get('/report/manager', async (req, res) => {
   return res.send(renderBuildingHtml(date));
 });
 
+// read-only: сырая история одной сессии + поиск маркеров рекламы/сторис (для анализа Instagram-входов)
+app.get('/probe-history', async (req, res) => {
+  const sid = req.query.session;
+  if (!sid) return res.status(400).json({ error: 'нужен ?session=<id> (например, из списка лидов в /report)' });
+  try {
+    const r = await fetch(WEBHOOK + '/imopenlines.session.history.get.json?SESSION_ID=' + encodeURIComponent(sid), { timeout: 15000 });
+    const j = await r.json();
+    const result = j && j.result;
+    if (!result) return res.json({ session: sid, error: (j && j.error) || 'no result', raw: j });
+    const msgs = Object.values(result.message || {}).sort(function (a, b) { return Number(a.id) - Number(b.id); });
+    const allText = msgs.map(function (m) { return String(m.text || ''); }).join(' ');
+    const markers = {
+      ad: /реклам|ad_id|referral|click to message|из рекламы|перешёл по рекламе|\bad\b|\bref\b/i.test(allText),
+      story: /стори|\bstory\b|reply_to|ответил[а]? на (вашу )?истор|ответ на истори|упомянул[а]? вас/i.test(allText)
+    };
+    res.json({
+      session: sid,
+      chatId: result.chatId,
+      users: result.users || {},
+      markers: markers,
+      messages: msgs.map(function (m) { return { id: m.id, senderid: m.senderid, date: m.date, text: String(m.text || '').substring(0, 400) }; })
+    });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
 app.get('/refresh', async (req, res) => {
   const key = req.query.key;
   if (key) { 
