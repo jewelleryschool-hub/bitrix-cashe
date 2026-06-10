@@ -1345,6 +1345,8 @@ async function computeWorkday2(date, lookback, maxSessions) {
     const unansweredDm = [];
     const unansweredComments = [];
     const altanetsGap = [];
+    const managerThreads = {};
+    const pushThread = function (nm, t) { if (!managerThreads[nm]) managerThreads[nm] = []; managerThreads[nm].push(t); };
 
     Object.values(sessions).forEach(function (s) {
       const recs = s.records || [];
@@ -1380,6 +1382,35 @@ async function computeWorkday2(date, lookback, maxSessions) {
           if (!isComment && String(s.responsible) === '10') altanetsGap.push(rec);
         }
       }
+
+      // переписки за день по менеджеру (для персональных отчётов)
+      const dayRecs = recs.filter(r => r.day === date);
+      if (dayRecs.length) {
+        const repliers = {};
+        dayRecs.forEach(function (r) { if (r.kind === 'OURSIDE' && r.opName) repliers[r.opName] = true; });
+        const hasClientToday = dayRecs.some(r => r.kind === 'CLIENT');
+        let firstRespMin = null, pend = null;
+        dayRecs.forEach(function (r) {
+          if (r.kind === 'CLIENT') { if (pend === null) pend = r; }
+          else if (r.kind === 'OURSIDE') { if (pend && r.date && pend.date && firstRespMin === null) { const mm = (new Date(r.date) - new Date(pend.date)) / 60000; if (mm >= 0) firstRespMin = Math.round(mm); } pend = null; }
+        });
+        const lastRec = recs[recs.length - 1];
+        const isComm = /\(комментарии\)/.test(s.subject) || /^Комментарий к посту/.test(lastRec.text || '');
+        const thread = {
+          session: s.sessionId, chatId: s.chatId || null, client: s.subject, channel: wd2Channel(s.subject),
+          status: lastRec.kind === 'CLIENT' ? 'waiting_us' : 'waiting_client',
+          is_comment: isComm,
+          first_response_min: firstRespMin,
+          client_msgs: dayRecs.filter(r => r.kind === 'CLIENT').length,
+          our_msgs: dayRecs.filter(r => r.kind === 'OURSIDE').length,
+          handled_by: Object.keys(repliers),
+          messages: dayRecs.slice(-30).map(function (r) { return { who: r.kind === 'CLIENT' ? 'client' : (r.opName === 'Ромео' ? 'romeo' : 'manager'), op: r.opName || null, time: r.date, text: String(r.text || '').substring(0, 350) }; })
+        };
+        const owners = {};
+        Object.keys(repliers).forEach(function (n) { owners[n] = true; });
+        if (respName && hasClientToday) owners[respName] = true;
+        Object.keys(owners).forEach(function (n) { pushThread(n, thread); });
+      }
     });
 
     const managersOut = {};
@@ -1398,6 +1429,20 @@ async function computeWorkday2(date, lookback, maxSessions) {
     unansweredDm.sort((a, b) => String(b.time).localeCompare(String(a.time)));
     unansweredComments.sort((a, b) => String(b.time).localeCompare(String(a.time)));
 
+    // персональные переписки: ждущие ответа — сверху, потом по свежести, ограничиваем объём
+    const managerThreadsOut = {};
+    Object.keys(managerThreads).forEach(function (n) {
+      const arr = managerThreads[n].slice();
+      arr.sort(function (a, b) {
+        const ra = a.status === 'waiting_us' ? 0 : 1, rb = b.status === 'waiting_us' ? 0 : 1;
+        if (ra !== rb) return ra - rb;
+        const ta = a.messages.length ? a.messages[a.messages.length - 1].time : '';
+        const tb = b.messages.length ? b.messages[b.messages.length - 1].time : '';
+        return String(tb).localeCompare(String(ta));
+      });
+      managerThreadsOut[n] = arr.slice(0, 60);
+    });
+
     const result = {
       date, lookback_days: lookback,
       sessions_scanned: sessIds.length,
@@ -1408,6 +1453,7 @@ async function computeWorkday2(date, lookback, maxSessions) {
       unanswered_comments_count: unansweredComments.length, // комментарии/реакции под постами (НЕ горячие лиды)
       unanswered_comments: unansweredComments.slice(0, 40),  // отвечать вручную в Instagram (Pact не шлёт ответы в комментарии)
       altanets_gap: altanetsGap.slice(0, 50),       // личные диалоги Алтанца (болеет) без ответа
+      manager_threads: managerThreadsOut,           // переписки за день по каждому менеджеру (для персональных отчётов)
       updatedAt: new Date().toISOString()
     };
     cache[cacheKey] = result; lastUpdate[cacheKey] = Date.now();
@@ -1439,6 +1485,8 @@ app.get('/workday2', async (req, res) => {
 
 // ===== ЧИТАЕМЫЙ ЕЖЕДНЕВНЫЙ ОТЧЁТ (HTML) =====
 const WD2_MGR_ID = { 'Алтанец': '10', 'Кашинский': '20326', 'Самарина': '73320', 'Ромео': '80198' };
+// секретные токены персональных ссылок (менеджер видит ТОЛЬКО свой отчёт, чужие — нет)
+const MANAGER_TOKENS = { 'k7f3a9c2x': 'Кашинский', 's2b8e1d5q': 'Самарина', 'a1lt5n3cw': 'Алтанец', 'r4m0e9o1z': 'Ромео' };
 function wd2Key(date, lookback) { return 'workday2_' + date + '_lb' + lookback; }
 function wd2Esc(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function wd2Name(subj) { const m = String(subj || '').match(/"([^"]+)"/); return m ? m[1] : String(subj || ''); }
@@ -1585,6 +1633,95 @@ function renderManagerHtml(d, name) {
     dm +
     '</div></body></html>';
 }
+function wd2StatusBadge(st) {
+  if (st === 'waiting_us') return '<span class="badge red">ждёт ответа</span>';
+  if (st === 'waiting_client') return '<span class="badge grey">ждём клиента</span>';
+  return '<span class="badge grey">—</span>';
+}
+function wd2ThreadCard(t) {
+  const link = t.chatId ? ('https://b24-99blai.bitrix24.ru/online/?IM_HISTORY=imol|' + t.chatId) : null;
+  const nm = wd2Esc(wd2Name(t.client));
+  const title = link ? ('<a href="' + link + '" target="_blank">' + nm + '</a>') : nm;
+  const flags = [];
+  if (t.client_msgs > 0 && t.our_msgs === 0) flags.push('<span class="flag red">нет ответа</span>');
+  if (t.first_response_min != null && t.first_response_min > 30) flags.push('<span class="flag amber">медленно ' + t.first_response_min + 'м</span>');
+  if (t.handled_by && t.handled_by.indexOf('Ромео') !== -1) flags.push('<span class="flag teal">вёл Ромео</span>');
+  if (t.is_comment) flags.push('<span class="flag purp">комментарий</span>');
+  const bubbles = (t.messages || []).map(function (m) {
+    const side = m.who === 'client' ? 'cl' : 'us';
+    const who = m.who === 'client' ? 'Клиент' : (m.who === 'romeo' ? 'Ромео' : (m.op || 'Менеджер'));
+    const txt = String(m.text || '').trim() ? wd2Esc(m.text) : '<span class="muted">(вложение / реакция)</span>';
+    return '<div class="bub ' + side + '"><div class="bw">' + txt + '</div><div class="bm">' + wd2Esc(who) + ' · ' + wd2Time(m.time) + '</div></div>';
+  }).join('') || '<div class="muted">нет сообщений за день</div>';
+  return '<details class="conv"><summary>' +
+    '<span class="cv-h">' + title + ' <span class="chip">' + wd2Esc(t.channel) + '</span></span>' +
+    '<span class="cv-meta">' + wd2StatusBadge(t.status) + ' ' + flags.join(' ') + ' <span class="muted">' + t.client_msgs + '↓ ' + t.our_msgs + '↑</span></span>' +
+    '</summary><div class="thread">' + bubbles + '</div></details>';
+}
+const WD2_CSS2 = '<style>' +
+  '.badge{font-size:11px;padding:2px 8px;border-radius:6px;font-weight:600;white-space:nowrap}' +
+  '.badge.red{background:#fde8e8;color:#c81e1e}.badge.grey{background:#eef1f4;color:#5b6470}' +
+  '.flag{font-size:11px;padding:1px 6px;border-radius:5px;white-space:nowrap}' +
+  '.flag.red{background:#fde8e8;color:#c81e1e}.flag.amber{background:#fff4e0;color:#9a6700}.flag.teal{background:#e0f5f3;color:#0f766e}.flag.purp{background:#f3e8ff;color:#7e22ce}' +
+  '.conv{background:var(--card);border:1px solid var(--line);border-radius:9px;margin-bottom:8px;overflow:hidden}' +
+  '.conv summary{list-style:none;cursor:pointer;padding:10px 13px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center}' +
+  '.conv summary::-webkit-details-marker{display:none}.conv[open] summary{border-bottom:1px solid var(--line)}' +
+  '.cv-h{font-weight:600;font-size:14px}.cv-h a{color:var(--blue);text-decoration:none}' +
+  '.cv-meta{font-size:12px;color:var(--mut);display:flex;align-items:center;gap:5px;flex-wrap:wrap}' +
+  '.thread{padding:12px 13px;display:flex;flex-direction:column;gap:8px;background:#fbfcfd}' +
+  '.bub{max-width:80%}.bub.cl{align-self:flex-start}.bub.us{align-self:flex-end}' +
+  '.bw{padding:8px 11px;border-radius:12px;font-size:13px;line-height:1.4;white-space:pre-wrap;word-break:break-word}' +
+  '.bub.cl .bw{background:#eef1f4;color:#1d2129;border-bottom-left-radius:3px}' +
+  '.bub.us .bw{background:#2563eb;color:#fff;border-bottom-right-radius:3px}' +
+  '.bm{font-size:11px;color:var(--mut);margin-top:2px}.bub.us .bm{text-align:right}' +
+  '.priv{background:#eef6ff;border:1px solid #cfe2ff;color:#1e497a;padding:8px 12px;border-radius:8px;font-size:12px;margin-bottom:14px}' +
+  '</style>';
+function renderManagerFullHtml(d, name, token) {
+  const lb = d.lookback_days;
+  const base = '/m/' + token;
+  const m = d.managers[name] || { messages_on_date: 0, sessions_active_on_date: 0, sessions_assigned: 0, avg_first_response_min: null, responses_measured: 0 };
+  const waiting = (d.unanswered_dm || []).filter(function (r) { return String(r.assigned) === name; });
+  const threads = (d.manager_threads && d.manager_threads[name]) || [];
+  const waitingT = threads.filter(function (t) { return t.status === 'waiting_us'; });
+  const doneT = threads.filter(function (t) { return t.status !== 'waiting_us'; });
+  const sla = m.avg_first_response_min == null ? '—' : (m.avg_first_response_min + ' мин');
+  const today = new Date().toISOString().substring(0, 10);
+  const yest = new Date(new Date(d.date + 'T00:00:00').getTime() - 86400000).toISOString().substring(0, 10);
+  const tom = new Date(new Date(d.date + 'T00:00:00').getTime() + 86400000).toISOString().substring(0, 10);
+  const dmCards = waiting.map(wd2LeadCard).join('') || '<div class="empty">Никто не ждёт ответа 🎉</div>';
+  const waitCards = waitingT.map(wd2ThreadCard).join('') || '<div class="empty">Нет открытых переписок, ждущих ответа</div>';
+  const doneCards = doneT.map(wd2ThreadCard).join('') || '<div class="empty">Других переписок за день нет</div>';
+  return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>' + wd2Esc(name) + ' · ' + wd2Esc(d.date) + '</title>' + WD2_CSS + WD2_CSS2 + '</head><body><div class="wrap">' +
+    '<h1>Отчёт менеджера: ' + wd2Esc(name) + '</h1>' +
+    '<div class="sub">' + wd2Esc(d.date) + ' · окно ' + lb + ' дн. · обновлено ' + wd2Esc(String(d.updatedAt || '').substring(11, 16)) + ' UTC</div>' +
+    '<div class="priv">Это ваша персональная страница. Ссылка личная — по ней видно только ваши переписки.</div>' +
+    '<form class="toolbar" method="get" action="' + base + '">' +
+    '<a href="' + base + '?date=' + yest + '&lookback=' + lb + '">← ' + yest + '</a>' +
+    '<input type="date" name="date" value="' + wd2Esc(d.date) + '">' +
+    '<input type="hidden" name="lookback" value="' + lb + '">' +
+    '<button type="submit">Показать</button>' +
+    (d.date < today ? '<a href="' + base + '?date=' + tom + '&lookback=' + lb + '">' + tom + ' →</a>' : '') +
+    '<a class="primary" href="' + base + '?date=' + wd2Esc(d.date) + '&lookback=' + lb + '&fresh=1">↻ Обновить</a>' +
+    '</form>' +
+    wd2WinSelector(base, wd2Esc(d.date), lb) +
+    '<div class="cards">' +
+    '<div class="kpi"><div class="n">' + m.messages_on_date + '</div><div class="l">сообщений за день</div></div>' +
+    '<div class="kpi"><div class="n">' + m.sessions_active_on_date + '</div><div class="l">активных переписок</div></div>' +
+    '<div class="kpi"><div class="n">' + m.sessions_assigned + '</div><div class="l">назначено за окно</div></div>' +
+    '<div class="kpi"><div class="n">' + sla + '</div><div class="l">ср. первый ответ</div></div>' +
+    '<div class="kpi"><div class="n">' + waiting.length + '</div><div class="l">ждут вашего ответа</div></div>' +
+    '</div>' +
+    '<h2>Нужно ответить (' + waiting.length + ')</h2>' +
+    '<div class="sub" style="margin-top:-4px">Имя кликабельно → открывает чат в Битриксе.</div>' +
+    dmCards +
+    '<h2>Разбор переписок за день — ждут ответа (' + waitingT.length + ')</h2>' +
+    '<div class="sub" style="margin-top:-4px">Нажмите на строку, чтобы развернуть всю переписку.</div>' +
+    waitCards +
+    '<h2>Остальные переписки за день (' + doneT.length + ')</h2>' +
+    doneCards +
+    '</div></body></html>';
+}
 function renderBuildingHtml(date) {
   return '<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<meta http-equiv="refresh" content="15"><title>Собираю отчёт…</title><style>' +
@@ -1626,6 +1763,20 @@ app.get('/report/manager', async (req, res) => {
   const cacheKey = wd2EnsureBuild(date, lookback, maxSessions, wantFresh);
   res.set('Content-Type', 'text/html; charset=utf-8');
   if (cache[cacheKey]) return res.send(renderManagerHtml(cache[cacheKey], name));
+  return res.send(renderBuildingHtml(date));
+});
+
+// ИЗОЛИРОВАННАЯ персональная ссылка менеджера — видно только его переписки, чужих нет
+app.get('/m/:token', async (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  const name = MANAGER_TOKENS[req.params.token];
+  if (!name) return res.status(404).send('<!doctype html><html lang="ru"><head><meta charset="utf-8"></head><body style="font-family:-apple-system,sans-serif;padding:40px;text-align:center;color:#555">Ссылка недействительна.</body></html>');
+  const date = req.query.date || new Date().toISOString().substring(0, 10);
+  const lookback = Math.min(parseInt(req.query.lookback || '2', 10), 14);
+  const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
+  const wantFresh = !!req.query.fresh;
+  const cacheKey = wd2EnsureBuild(date, lookback, maxSessions, wantFresh);
+  if (cache[cacheKey]) return res.send(renderManagerFullHtml(cache[cacheKey], name, req.params.token));
   return res.send(renderBuildingHtml(date));
 });
 
