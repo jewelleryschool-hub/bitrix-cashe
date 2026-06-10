@@ -1406,6 +1406,7 @@ async function computeWorkday2(date, lookback, maxSessions) {
       unanswered_dm_count: unansweredDm.length,     // реальные личные диалоги без ответа (горячие лиды)
       unanswered_dm: unansweredDm.slice(0, 60),
       unanswered_comments_count: unansweredComments.length, // комментарии/реакции под постами (НЕ горячие лиды)
+      unanswered_comments: unansweredComments.slice(0, 40),  // отвечать вручную в Instagram (Pact не шлёт ответы в комментарии)
       altanets_gap: altanetsGap.slice(0, 50),       // личные диалоги Алтанца (болеет) без ответа
       updatedAt: new Date().toISOString()
     };
@@ -1465,7 +1466,8 @@ const WD2_CSS = '<style>' +
   'th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:14px}th{font-size:12px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.03em}' +
   'tr:last-child td{border-bottom:none}td.nm{font-weight:600}td.nm a{color:var(--blue);text-decoration:none}td.nm a:hover{text-decoration:underline}td.muted{color:var(--mut)}' +
   '.lead{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--mut);border-radius:9px;padding:10px 13px;margin-bottom:8px}' +
-  '.lead.hot{border-left-color:var(--red)}.lead.cool{border-left-color:#c9ced6}' +
+  '.lead.hot{border-left-color:var(--red)}.lead.cool{border-left-color:#c9ced6}.lead.cmt{border-left-color:#a855f7}' +
+  '.cmtchip{background:#f3e8ff;color:#7e22ce}' +
   '.lead-h{display:flex;justify-content:space-between;gap:10px;align-items:baseline;flex-wrap:wrap}' +
   '.lead-name{font-weight:600;font-size:14px}.lead-name a{color:var(--blue);text-decoration:none}.lead-name a:hover{text-decoration:underline}' +
   '.lead-meta{color:var(--mut);font-size:12px;white-space:nowrap}' +
@@ -1492,6 +1494,16 @@ function wd2LeadCard(r) {
     '<span class="lead-meta"><span class="chip">' + wd2Channel(r.client) + '</span> ' + wd2Esc(r.assigned) + ' · ' + wd2Time(r.time) + '</span></div>' +
     '<div class="lead-msg">' + wd2Esc(r.last_message) + '</div></div>';
 }
+function wd2CommentCard(r) {
+  const link = r.chatId ? ('https://b24-99blai.bitrix24.ru/online/?IM_HISTORY=imol|' + r.chatId) : null;
+  const nm = wd2Esc(wd2Name(r.client));
+  const title = link ? ('<a href="' + link + '" target="_blank">' + nm + '</a>') : nm;
+  const msg = String(r.last_message || '').trim() ? wd2Esc(r.last_message) : '<span class="muted">(реакция / вложение)</span>';
+  return '<div class="lead cmt">' +
+    '<div class="lead-h"><span class="lead-name">' + title + '</span>' +
+    '<span class="lead-meta"><span class="chip">' + wd2Channel(r.client) + '</span> <span class="chip cmtchip">комментарий</span> ' + wd2Time(r.time) + '</span></div>' +
+    '<div class="lead-msg">' + msg + '</div></div>';
+}
 function renderWorkday2Html(d, rebuilding) {
   const lb = d.lookback_days;
   const order = ['Ромео', 'Кашинский', 'Самарина', 'Алтанец'];
@@ -1504,6 +1516,7 @@ function renderWorkday2Html(d, rebuilding) {
     return '<tr><td class="nm"><a href="' + mlink + '">' + wd2Esc(n) + '</a></td><td>' + m.messages_on_date + '</td><td>' + m.sessions_active_on_date + '</td><td>' + m.sessions_assigned + '</td><td>' + sla + '</td><td class="muted">' + m.responses_measured + '</td></tr>';
   }).join('');
   const dm = (d.unanswered_dm || []).map(wd2LeadCard).join('') || '<div class="empty">Нет диалогов, где клиент ждёт ответа 🎉</div>';
+  const comments = (d.unanswered_comments || []).map(wd2CommentCard).join('') || '<div class="empty">Комментариев без ответа нет</div>';
   const gap = (d.altanets_gap || []).length
     ? '<h2>Висит на Алтанце (болеет) — перераздать</h2>' + (d.altanets_gap || []).map(wd2LeadCard).join('')
     : '';
@@ -1536,6 +1549,9 @@ function renderWorkday2Html(d, rebuilding) {
     '<h2>Клиенты ждут ответа (' + (d.unanswered_dm_count || 0) + ')</h2>' +
     '<div class="sub" style="margin-top:-4px">Красная полоса — содержательное сообщение (вероятно горячий лид). Имя кликабельно → открывает чат в Битриксе.</div>' +
     dm +
+    '<h2>Комментарии под постами (' + (d.unanswered_comments_count || 0) + ')</h2>' +
+    '<div class="sub" style="margin-top:-4px">Отвечать <b>только вручную в приложении Instagram</b> — Pact не отправляет ответы в комментарии. Это <b>не</b> промахи Ромео.</div>' +
+    comments +
     gap +
     '<footer>Источник: открытые линии Битрикс24. «Назначено» = сессии, стартовавшие за окно. SLA первого ответа — по сообщениям клиента за этот день.</footer>' +
     '</div></body></html>';
