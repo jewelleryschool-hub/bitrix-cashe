@@ -1675,13 +1675,84 @@ const WD2_CSS2 = '<style>' +
   '.bub.us .bw{background:#2563eb;color:#fff;border-bottom-right-radius:3px}' +
   '.bm{font-size:11px;color:var(--mut);margin-top:2px}.bub.us .bm{text-align:right}' +
   '.priv{background:#eef6ff;border:1px solid #cfe2ff;color:#1e497a;padding:8px 12px;border-radius:8px;font-size:12px;margin-bottom:14px}' +
+  '.exbox{background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 16px}' +
+  '.exbox.warn{background:#fff7e6;border-color:#ffe1a8;color:#7a5b00}' +
+  '.exh{font-size:14px;margin:14px 0 6px}.exbox p{font-size:13.5px;margin:6px 0;line-height:1.5}.exbox p:first-child{margin-top:0}' +
+  '.exl{margin:6px 0 6px 18px;padding:0}.exl li{font-size:13.5px;margin:3px 0;line-height:1.45}' +
+  '.exmeta{color:var(--mut);font-size:11px;margin-top:12px}' +
+  '.exwait{background:#f0f4ff;border:1px dashed #cfe0ff;color:#3a5a8a;border-radius:10px;padding:14px 16px;font-size:13px}' +
   '</style>';
+function wd2MdToHtml(text) {
+  const lines = String(text || '').split('\n');
+  const inline = function (s) { return wd2Esc(s).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>'); };
+  let html = '', inList = false;
+  const closeList = function () { if (inList) { html += '</ul>'; inList = false; } };
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) { closeList(); continue; }
+    const h = line.match(/^#{1,4}\s+(.*)$/);
+    if (h) { closeList(); html += '<h3 class="exh">' + inline(h[1]) + '</h3>'; continue; }
+    const b = line.match(/^[-*•]\s+(.*)$/);
+    if (b) { if (!inList) { html += '<ul class="exl">'; inList = true; } html += '<li>' + inline(b[1]) + '</li>'; continue; }
+    closeList();
+    html += '<p>' + inline(line) + '</p>';
+  }
+  closeList();
+  return html;
+}
+function wd2RenderAnalysis(a) {
+  if (!a) return '';
+  if (a.error === 'NO_KEY') return '<div class="exbox warn">Экспертный разбор выключен: добавьте переменную <b>ANTHROPIC_API_KEY</b> в Variables на Railway и обновите страницу.</div>';
+  if (a.error) return '<div class="exbox warn">Не удалось сгенерировать разбор: ' + wd2Esc(a.error) + '. Обновите страницу (↻).</div>';
+  if (a.text) return '<div class="exbox">' + wd2MdToHtml(a.text) + '<div class="exmeta">Сгенерировано Claude' + (a.model ? ' (' + wd2Esc(a.model) + ')' : '') + '</div></div>';
+  return '';
+}
+// генерация экспертного разбора переписок менеджера за день (фон, кэшируется)
+async function computeManagerAnalysis(d, name) {
+  const analKey = 'wd2anal_' + d.date + '_lb' + d.lookback_days + '_' + name;
+  const key = process.env.ANTHROPIC_API_KEY;
+  const save = function (r) { cache[analKey] = r; lastUpdate[analKey] = Date.now(); try { setCache(analKey, r); } catch (e) { } return r; };
+  if (!key) return save({ error: 'NO_KEY' });
+  const threads = (d.manager_threads && d.manager_threads[name]) || [];
+  if (!threads.length) return save({ text: 'За этот день переписок нет — разбирать нечего.' });
+  const pick = threads.slice(0, 14);
+  const transcript = pick.map(function (t, i) {
+    const head = '### Диалог ' + (i + 1) + ' — ' + wd2Name(t.client) + ' (' + t.channel + (t.is_comment ? ', комментарий' : '') + '), статус: ' +
+      (t.status === 'waiting_us' ? 'ждёт нашего ответа' : 'ждём клиента') + (t.first_response_min != null ? (', первый ответ ' + t.first_response_min + ' мин') : '');
+    const body = (t.messages || []).slice(-16).map(function (m) {
+      const who = m.who === 'client' ? 'КЛИЕНТ' : (m.who === 'romeo' ? 'РОМЕО(бот)' : (m.op || 'МЕНЕДЖЕР'));
+      return who + ': ' + (String(m.text || '').trim().substring(0, 300) || '(вложение)');
+    }).join('\n');
+    return head + '\n' + body;
+  }).join('\n\n');
+  const system = 'Ты — руководитель отдела продаж с 10-летним опытом в премиальном экспертном сегменте: офлайн- и онлайн-обучение ювелирному делу (закрепка камней, гравировка, 3D-моделирование), чеки от 86 000 ₽ до 1 400 000 ₽, аудитория — практикующие ювелиры и энтузиасты со всего мира. Ты разбираешь работу менеджера за день по его перепискам с клиентами. Дай честный, конкретный экспертный разбор — без воды и общих фраз, опираясь на конкретные реплики из диалогов. Отвечай по-русски. Структура: «## Оценка дня» (один абзац), «## Сделано правильно» (с примерами), «## Ошибки и упущенные продажи» (конкретный диалог → что не так → как надо было), «## Рекомендации на завтра» (3–5 пунктов списком). Не выдумывай фактов, которых нет в переписке. Если в диалоге вёл бот Ромео, а менеджер не подключился к горячему лиду — отметь это.';
+  const user = 'Менеджер: ' + name + '. Дата: ' + d.date + '.\n\nПереписки за день:\n\n' + transcript;
+  const model = process.env.ANALYSIS_MODEL || 'claude-opus-4-8';
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: model, max_tokens: 1600, system: system, messages: [{ role: 'user', content: user }] }),
+      timeout: 120000
+    });
+    const data = await resp.json();
+    let text = '';
+    if (data && Array.isArray(data.content)) text = data.content.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    if (!text) return save({ error: (data && data.error && data.error.message) ? data.error.message : 'пустой ответ модели' });
+    return save({ text: text, model: model, generatedAt: new Date().toISOString() });
+  } catch (e) {
+    return save({ error: String((e && e.message) || e) });
+  }
+}
 function renderManagerFullHtml(d, name, token) {
   const lb = d.lookback_days;
   const base = '/m/' + token;
   const m = d.managers[name] || { messages_on_date: 0, sessions_active_on_date: 0, sessions_assigned: 0, avg_first_response_min: null, responses_measured: 0 };
   const waiting = (d.unanswered_dm || []).filter(function (r) { return String(r.assigned) === name; });
   const threads = (d.manager_threads && d.manager_threads[name]) || [];
+  const analKey = 'wd2anal_' + d.date + '_lb' + lb + '_' + name;
+  const analysis = cache[analKey];
+  const analReady = !!(analysis && (analysis.text || analysis.error));
   const waitingT = threads.filter(function (t) { return t.status === 'waiting_us'; });
   const doneT = threads.filter(function (t) { return t.status !== 'waiting_us'; });
   const sla = m.avg_first_response_min == null ? '—' : (m.avg_first_response_min + ' мин');
@@ -1720,6 +1791,9 @@ function renderManagerFullHtml(d, name, token) {
     waitCards +
     '<h2>Остальные переписки за день (' + doneT.length + ')</h2>' +
     doneCards +
+    '<h2>Экспертный разбор дня</h2>' +
+    '<div id="exp">' + (analReady ? wd2RenderAnalysis(analysis) : '<div class="exwait">🧠 Готовлю экспертный разбор переписок как РОП с 10-летним стажем… появится здесь сам через ~20–40 секунд.</div>') + '</div>' +
+    (analReady ? '' : ('<script>(function(){var t=' + JSON.stringify(token) + ',dt=' + JSON.stringify(d.date) + ',lb=' + lb + ';function p(){fetch("/m/"+t+"/analysis?date="+dt+"&lookback="+lb).then(function(r){return r.json();}).then(function(j){if(j&&j.ready){var e=document.getElementById("exp");if(e)e.innerHTML=j.html;}else{setTimeout(p,8000);}}).catch(function(){setTimeout(p,8000);});}setTimeout(p,6000);})();</script>')) +
     '</div></body></html>';
 }
 function renderBuildingHtml(date) {
@@ -1776,8 +1850,34 @@ app.get('/m/:token', async (req, res) => {
   const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
   const wantFresh = !!req.query.fresh;
   const cacheKey = wd2EnsureBuild(date, lookback, maxSessions, wantFresh);
-  if (cache[cacheKey]) return res.send(renderManagerFullHtml(cache[cacheKey], name, req.params.token));
+  const analKey = 'wd2anal_' + date + '_lb' + lookback + '_' + name;
+  if (wantFresh) { delete cache[analKey]; delete lastUpdate[analKey]; }
+  if (cache[cacheKey]) {
+    if (!cache[analKey] && !loading[analKey]) {
+      loading[analKey] = true;
+      computeManagerAnalysis(cache[cacheKey], name).then(function () { loading[analKey] = false; }).catch(function () { loading[analKey] = false; });
+    }
+    return res.send(renderManagerFullHtml(cache[cacheKey], name, req.params.token));
+  }
   return res.send(renderBuildingHtml(date));
+});
+
+// JSON: готов ли экспертный разбор (страница менеджера сама опрашивает и подставляет без перезагрузки)
+app.get('/m/:token/analysis', async (req, res) => {
+  const name = MANAGER_TOKENS[req.params.token];
+  if (!name) return res.status(404).json({ ready: false, error: 'bad token' });
+  const date = req.query.date || new Date().toISOString().substring(0, 10);
+  const lookback = Math.min(parseInt(req.query.lookback || '2', 10), 14);
+  const maxSessions = Math.min(parseInt(req.query.max || '250', 10), 400);
+  const cacheKey = wd2EnsureBuild(date, lookback, maxSessions, false);
+  const analKey = 'wd2anal_' + date + '_lb' + lookback + '_' + name;
+  const a = cache[analKey];
+  if (a && (a.text || a.error)) return res.json({ ready: true, html: wd2RenderAnalysis(a) });
+  if (cache[cacheKey] && !loading[analKey]) {
+    loading[analKey] = true;
+    computeManagerAnalysis(cache[cacheKey], name).then(function () { loading[analKey] = false; }).catch(function () { loading[analKey] = false; });
+  }
+  return res.json({ ready: false });
 });
 
 // read-only: сырая история одной сессии + поиск маркеров рекламы/сторис (для анализа Instagram-входов)
