@@ -2054,6 +2054,133 @@ app.post('/claude', async (req, res) => {
 });
 
 // ============================================
+// ПЛАНИРОВЩИК НАПОМИНАНИЙ (follow-up на ~20 часах, пока открыто окно 24ч Meta)
+// Безопасно: по умолчанию ВЫКЛ. NUDGE_MODE=send включает авто-отправку; режим dry — только показывает.
+// ============================================
+const ROMEO_BOT_ID = '80198';
+const ROMEO_CLIENT_ID = 'local.6a255e256567a1.60218811';
+const NUDGE_ROMEO_IDS = ['80198', '80100', '80098'];
+const NUDGE_OPS = ['20326', '73320', '10'];
+
+async function nudgeClaude(lang, transcript) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return null;
+  const system = 'Ты — Romeo, цифровой помощник International Jewellery School (премиальное обучение ювелирному делу). Клиент написал тебе и пропал, не ответив. Напиши ОДНО короткое, тёплое и НЕнавязчивое follow-up сообщение (1–2 предложения) на ' + (lang === 'ru' ? 'русском' : 'английском') + ' языке: мягко напомни о себе по сути его вопроса, без давления и без «вы всё ещё там?». В конце предложи как опцию написать в WhatsApp wa.me/79956000477 (там отвечаем персонально и можем прислать фото/видео работ) ИЛИ продолжить здесь. Верни ТОЛЬКО текст сообщения, без кавычек и пояснений.';
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: process.env.ANALYSIS_MODEL || 'claude-opus-4-8', max_tokens: 400, system: system, messages: [{ role: 'user', content: 'Переписка:\n' + transcript }] }),
+      timeout: 60000
+    });
+    const data = await resp.json();
+    if (data && Array.isArray(data.content)) { const t = data.content.filter(b => b.type === 'text').map(b => b.text).join(' ').trim(); if (t) return t; }
+  } catch (e) { }
+  return null;
+}
+async function nudgeText(lang, transcript) {
+  if (process.env.NUDGE_CONTEXTUAL === '1') { const t = await nudgeClaude(lang, transcript); if (t) return t; }
+  return lang === 'ru'
+    ? 'Здравствуйте! Возвращаюсь к нашему диалогу — если будет удобно, с радостью помогу с выбором и подскажу детали. Можно написать нам в WhatsApp: wa.me/79956000477, там ответим персонально и при необходимости пришлём фото и видео работ. Или продолжим прямо здесь, как вам удобнее 🙂'
+    : 'Hi! Just following up on our chat — happy to help you choose and share any details whenever it suits you. You can message us on WhatsApp: wa.me/79956000477, where we reply personally and can send photos and videos of our work. Or we can continue right here, whatever works best 🙂';
+}
+
+async function runNudgeSweep(mode) {
+  const sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+  const MIN_H = Number(process.env.NUDGE_MIN_HOURS || 19);
+  const MAX_H = Number(process.env.NUDGE_MAX_HOURS || 23);
+  const PER_RUN = Number(process.env.NUDGE_MAX_PER_RUN || 8);
+  const now = Date.now();
+  const report = { mode: mode, at: new Date().toISOString(), window_hours: [MIN_H, MAX_H], scanned: 0, eligible: [], sent: [], skipped: {} };
+  const skip = function (k) { report.skipped[k] = (report.skipped[k] || 0) + 1; };
+  let acts = [];
+  try {
+    const r0 = await fetch(WEBHOOK + '/crm.activity.list.json?order[CREATED]=DESC&filter[PROVIDER_ID]=IMOPENLINES_SESSION&select[]=ID&select[]=SUBJECT&select[]=CREATED&select[]=ASSOCIATED_ENTITY_ID&select[]=PROVIDER_PARAMS&start=0', { timeout: 15000 });
+    const j0 = await r0.json();
+    acts = (j0 && j0.result) || [];
+  } catch (e) { report.error = 'activity: ' + String((e && e.message) || e); return report; }
+  report.scanned = acts.length;
+  let done = 0;
+  for (const a of acts) {
+    if (done >= PER_RUN) break;
+    const sid = a.ASSOCIATED_ENTITY_ID;
+    const subject = a.SUBJECT || '';
+    if (/\(комментарии\)/i.test(subject)) { skip('comment'); continue; }
+    if (cache['nudged_' + sid]) { skip('already_nudged'); continue; }
+    let hist = null;
+    try { const rr = await fetch(WEBHOOK + '/imopenlines.session.history.get.json?SESSION_ID=' + encodeURIComponent(sid), { timeout: 15000 }); hist = await rr.json(); }
+    catch (e) { skip('hist_error'); await sleep(400); continue; }
+    const result = hist && hist.result;
+    if (!result || !result.message) { skip('no_messages'); await sleep(400); continue; }
+    const users = result.users || {};
+    const chatId = result.chatId;
+    const msgs = Object.values(result.message).sort(function (x, y) { return Number(x.id) - Number(y.id); });
+    let operatorPresent = false, hasRomeoMsg = false, hadClient = false, isComment = false;
+    let lastClient = null, lastOurs = null, lang = 'en';
+    const tail = [];
+    for (const m of msgs) {
+      const s = String(m.senderid || '0'); const raw = String(m.text || '');
+      if (s === '0') continue;
+      const u = users[s] || {};
+      const isOut = /^\s*(?:\[[^\]]*\]\s*)?Ответ оператора/i.test(raw);
+      const t = m.date ? new Date(m.date).getTime() : null;
+      if (NUDGE_OPS.indexOf(s) !== -1) operatorPresent = true;
+      if (NUDGE_ROMEO_IDS.indexOf(s) !== -1) hasRomeoMsg = true;
+      if (/\(комментарии\)/i.test(raw) || /Комментарий к посту/i.test(raw)) isComment = true;
+      const clean = raw.replace(/Ответ оператора\s*\([^)]*\)/gi, ' ').replace(/(?:Instagram business|Whatsapp|Telegram)\b.*?to JAG\s*\(channel id[^)]*\)/gi, ' ').replace(/\[\/?[A-Za-z][^\]]*\]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (u.connector && !isOut) { hadClient = true; if (t) lastClient = t; if (/[а-яё]/i.test(raw)) lang = 'ru'; if (clean) tail.push('КЛИЕНТ: ' + clean.substring(0, 200)); }
+      else { if (t) lastOurs = t; if (clean) tail.push('МЫ: ' + clean.substring(0, 200)); }
+    }
+    if (isComment) { skip('comment'); await sleep(400); continue; }
+    if (operatorPresent) { skip('operator_present'); await sleep(400); continue; }
+    if (!hasRomeoMsg) { skip('not_romeo_handled'); await sleep(400); continue; }
+    if (!hadClient || !lastClient) { skip('no_client_msg'); await sleep(400); continue; }
+    if (!lastOurs) { skip('we_never_replied'); await sleep(400); continue; }
+    if (lastClient > lastOurs) { skip('client_replied_last'); await sleep(400); continue; } // клиент ответил — не молчит
+    const hSilent = (now - lastClient) / 3600000;
+    if (hSilent < MIN_H || hSilent > MAX_H) { skip('out_of_window'); await sleep(400); continue; }
+    const dialogId = 'chat' + (chatId || '');
+    const name = subject.replace(/^Чат открытой линии - /, '').replace(/ \(.*$/, '');
+    const transcript = tail.slice(-10).join('\n');
+    if (mode === 'send') {
+      const text = await nudgeText(lang, transcript);
+      const item = { session: sid, name: name, lang: lang, hours_silent: Math.round(hSilent * 10) / 10, text: text };
+      try {
+        const sr = await fetch(WEBHOOK + '/imbot.message.add.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ BOT_ID: ROMEO_BOT_ID, CLIENT_ID: ROMEO_CLIENT_ID, DIALOG_ID: dialogId, MESSAGE: text }), timeout: 15000 });
+        const sj = await sr.json();
+        item.sent = !!(sj && sj.result); if (sj && sj.error) item.error = sj.error + ': ' + (sj.error_description || '');
+      } catch (e) { item.error = String((e && e.message) || e); }
+      cache['nudged_' + sid] = { at: new Date().toISOString(), text: text };
+      try { await setCache('nudged_' + sid, cache['nudged_' + sid]); } catch (e) { }
+      report.sent.push(item);
+      done++;
+    } else {
+      report.eligible.push({ session: sid, name: name, lang: lang, hours_silent: Math.round(hSilent * 10) / 10, would_text: await nudgeText(lang, transcript) });
+      done++;
+    }
+    await sleep(400);
+  }
+  return report;
+}
+
+// ручной запуск: dry — только показать; send — реально отправить (нужен &key=NUDGE_KEY)
+app.get('/nudge-run', async (req, res) => {
+  const mode = req.query.mode === 'send' ? 'send' : 'dry';
+  if (mode === 'send') {
+    if (!process.env.NUDGE_KEY || req.query.key !== process.env.NUDGE_KEY) return res.status(403).json({ error: 'send требует ?key=NUDGE_KEY' });
+  }
+  try { const r = await runNudgeSweep(mode); res.json(r); } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
+// авто-планировщик: каждые 30 мин, только если NUDGE_MODE=send
+if (process.env.NUDGE_MODE === 'send') {
+  setInterval(function () {
+    runNudgeSweep('send').then(function (r) { if (r.sent && r.sent.length) console.log('🔔 nudge sent:', r.sent.length); }).catch(function (e) { console.log('nudge sweep error', e && e.message); });
+  }, 30 * 60 * 1000);
+  console.log('🔔 Nudge scheduler ON (every 30 min)');
+}
+
+// ============================================
 // STARTUP
 // ============================================
 app.listen(PORT, async () => {
