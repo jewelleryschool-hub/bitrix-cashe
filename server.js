@@ -2305,7 +2305,22 @@ app.get('/photo-test', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
-// поиск открытого диалога → отдаёт готовый chatId. ?q=имя (по последним сессиям) или ?lead=ID (по лиду)
+// тест-отправка ТЕКСТА от бота: /text-test?dialog=chatNNNN&len=700&key=PHOTO_KEY  (или &msg=произвольный текст)
+app.get('/text-test', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  const dialog = req.query.dialog;
+  if (!dialog) return res.status(400).json({ error: 'нужен ?dialog=chatNNNN (+ len=ЧИСЛО или msg=текст)' });
+  let msg = req.query.msg || 'тест';
+  const len = parseInt(req.query.len || '0', 10);
+  if (len > 0) { const head = 'Тест длины ' + len + ' символов. '; msg = head + 'абвгде '.repeat(Math.ceil((len - head.length) / 7)); msg = msg.substring(0, len); }
+  try {
+    const sr = await fetch(WEBHOOK + '/imbot.message.add.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ BOT_ID: ROMEO_BOT_ID, CLIENT_ID: ROMEO_CLIENT_ID, DIALOG_ID: dialog, MESSAGE: msg }), timeout: 15000 });
+    const sj = await sr.json();
+    res.json({ dialog: dialog, chars: msg.length, send_result: sj.result, error: sj.error, error_description: sj.error_description, note: 'проверь в Instagram, дошло ли это сообщение' });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
+
 app.get('/find-chat', async (req, res) => {
   const q = String(req.query.q || '').toLowerCase().trim();
   const lead = String(req.query.lead || '').trim();
