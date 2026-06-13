@@ -2230,6 +2230,53 @@ if (process.env.NUDGE_MODE === 'send') {
 }
 
 // ============================================
+// ФОТО-ОБРАЗЦЫ: probe Диска + тест-отправка (шаг 1–2 реализации отправки фото)
+// Требует у вебхука право scope "disk". Read-only, кроме /photo-test (нужен ключ).
+// ============================================
+// просмотр Диска: без параметров — список хранилищ; ?folder=ID — содержимое папки; ?storage=ID — корень хранилища
+app.get('/disk-probe', async (req, res) => {
+  try {
+    const map = function (x) { return { ID: x.ID, TYPE: x.TYPE, NAME: x.NAME, SIZE: x.SIZE, DOWNLOAD_URL: x.DOWNLOAD_URL || null, DETAIL_URL: x.DETAIL_URL || null }; };
+    if (req.query.folder) {
+      const r = await fetch(WEBHOOK + '/disk.folder.getchildren.json?id=' + encodeURIComponent(req.query.folder), { timeout: 15000 });
+      const j = await r.json();
+      const items = (j.result || []).map(map);
+      return res.json({ folder: req.query.folder, count: items.length, folders: items.filter(i => i.TYPE === 'folder'), files: items.filter(i => i.TYPE === 'file'), error: j.error, error_description: j.error_description });
+    }
+    if (req.query.storage) {
+      const r = await fetch(WEBHOOK + '/disk.storage.getchildren.json?id=' + encodeURIComponent(req.query.storage), { timeout: 15000 });
+      const j = await r.json();
+      const items = (j.result || []).map(map);
+      return res.json({ storage: req.query.storage, count: items.length, folders: items.filter(i => i.TYPE === 'folder'), files: items.filter(i => i.TYPE === 'file'), error: j.error, error_description: j.error_description });
+    }
+    const r = await fetch(WEBHOOK + '/disk.storage.getlist.json', { timeout: 15000 });
+    const j = await r.json();
+    const st = (j.result || []).map(function (s) { return { ID: s.ID, NAME: s.NAME, ENTITY_TYPE: s.ENTITY_TYPE, ENTITY_ID: s.ENTITY_ID, ROOT_OBJECT_ID: s.ROOT_OBJECT_ID }; });
+    return res.json({ hint: 'дальше: /disk-probe?storage=<ID хранилища> или /disk-probe?folder=<ID папки> (ID папки берётся из folders[].ID)', storages: st, error: j.error, error_description: j.error_description });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
+// тест-отправка картинки в диалог: /photo-test?dialog=chatNNNN&file=<disk file id>&method=attach|link&key=PHOTO_KEY
+app.get('/photo-test', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY (задайте PHOTO_KEY в Variables)' });
+  const dialog = req.query.dialog, fileId = req.query.file, method = req.query.method === 'link' ? 'link' : 'attach';
+  if (!dialog || !fileId) return res.status(400).json({ error: 'нужны ?dialog=chatNNNN&file=<disk file id>' });
+  try {
+    const fr = await fetch(WEBHOOK + '/disk.file.get.json?id=' + encodeURIComponent(fileId), { timeout: 15000 });
+    const fj = await fr.json();
+    const f = fj.result;
+    if (!f) return res.json({ error: 'файл не найден', raw: fj });
+    const url = f.DOWNLOAD_URL;
+    const body = method === 'link'
+      ? { BOT_ID: ROMEO_BOT_ID, CLIENT_ID: ROMEO_CLIENT_ID, DIALOG_ID: dialog, MESSAGE: url }
+      : { BOT_ID: ROMEO_BOT_ID, CLIENT_ID: ROMEO_CLIENT_ID, DIALOG_ID: dialog, MESSAGE: f.NAME || ' ', ATTACH: [{ IMAGE: [{ NAME: f.NAME || 'photo', LINK: url, PREVIEW: url, WIDTH: 1000, HEIGHT: 1000 }] }] };
+    const sr = await fetch(WEBHOOK + '/imbot.message.add.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeout: 15000 });
+    const sj = await sr.json();
+    res.json({ method: method, dialog: dialog, file: { ID: f.ID, NAME: f.NAME, DOWNLOAD_URL: url }, send_result: sj.result, error: sj.error, error_description: sj.error_description, note: 'send_result не значит «дошло до Instagram» — проверь в самом Instagram' });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
+// ============================================
 // STARTUP
 // ============================================
 app.listen(PORT, async () => {
