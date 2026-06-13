@@ -2285,12 +2285,30 @@ app.get('/disk-probe', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
-// тест-отправка картинки в диалог: /photo-test?dialog=chatNNNN&file=<disk file id>&method=attach|link&key=PHOTO_KEY
+// тест-отправка картинки в диалог:
+//   method=attach — ATTACH-блок бота (Pact игнорит, уходит только текст)
+//   method=link   — ссылка текстом
+//   method=file   — РЕАЛЬНОЕ вложение в чат (folder.get → copyto → commit), доходит как фото
+// /photo-test?dialog=chatNNNN&file=<disk file id>&method=file&key=PHOTO_KEY
 app.get('/photo-test', async (req, res) => {
   if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY (задайте PHOTO_KEY в Variables)' });
-  const dialog = req.query.dialog, fileId = req.query.file, method = req.query.method === 'link' ? 'link' : 'attach';
+  const dialog = req.query.dialog, fileId = req.query.file;
+  const method = ['link', 'file'].indexOf(req.query.method) !== -1 ? req.query.method : 'attach';
   if (!dialog || !fileId) return res.status(400).json({ error: 'нужны ?dialog=chatNNNN&file=<disk file id>' });
   try {
+    if (method === 'file') {
+      const fgr = await fetch(WEBHOOK + '/im.disk.folder.get.json?DIALOG_ID=' + encodeURIComponent(dialog), { timeout: 15000 });
+      const fgj = await fgr.json();
+      const folderId = fgj.result && fgj.result.ID;
+      if (!folderId) return res.json({ method: method, step: 'im.disk.folder.get', error: fgj.error || 'нет папки чата', error_description: fgj.error_description, raw: fgj });
+      const cpr = await fetch(WEBHOOK + '/disk.file.copyto.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: fileId, targetFolderId: folderId }), timeout: 30000 });
+      const cpj = await cpr.json();
+      const newId = cpj.result && cpj.result.ID;
+      if (!newId) return res.json({ method: method, step: 'disk.file.copyto', error: cpj.error || 'копирование не удалось', error_description: cpj.error_description, raw: cpj });
+      const cmr = await fetch(WEBHOOK + '/im.disk.file.commit.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ DIALOG_ID: dialog, FILE_ID: newId, MESSAGE: '' }), timeout: 15000 });
+      const cmj = await cmr.json();
+      return res.json({ method: method, chat_folder: folderId, new_file_id: newId, commit_result: cmj.result, error: cmj.error, error_description: cmj.error_description, note: 'проверь в Instagram, пришло ли ФОТО как изображение' });
+    }
     const fr = await fetch(WEBHOOK + '/disk.file.get.json?id=' + encodeURIComponent(fileId), { timeout: 15000 });
     const fj = await fr.json();
     const f = fj.result;
@@ -2301,7 +2319,7 @@ app.get('/photo-test', async (req, res) => {
       : { BOT_ID: ROMEO_BOT_ID, CLIENT_ID: ROMEO_CLIENT_ID, DIALOG_ID: dialog, MESSAGE: f.NAME || ' ', ATTACH: [{ IMAGE: [{ NAME: f.NAME || 'photo', LINK: url, PREVIEW: url, WIDTH: 1000, HEIGHT: 1000 }] }] };
     const sr = await fetch(WEBHOOK + '/imbot.message.add.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeout: 15000 });
     const sj = await sr.json();
-    res.json({ method: method, dialog: dialog, file: { ID: f.ID, NAME: f.NAME, DOWNLOAD_URL: url }, send_result: sj.result, error: sj.error, error_description: sj.error_description, note: 'send_result не значит «дошло до Instagram» — проверь в самом Instagram' });
+    res.json({ method: method, dialog: dialog, file: { ID: f.ID, NAME: f.NAME, DOWNLOAD_URL: url }, send_result: sj.result, error: sj.error, error_description: sj.error_description, note: 'проверь в самом Instagram' });
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
