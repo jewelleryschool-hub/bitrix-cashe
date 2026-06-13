@@ -2372,6 +2372,67 @@ app.get('/find-chat', async (req, res) => {
 });
 
 // ============================================
+// ОТПРАВКА ОБРАЗЦОВ КУРСА: курс → папка в «образцы курсов» → N картинок реальным вложением
+// ============================================
+const COURSE_SAMPLES_ROOT = '524530'; // папка «образцы курсов» на Общем диске
+let courseFoldersCache = null, courseFoldersAt = 0;
+async function getCourseFolders() {
+  if (courseFoldersCache && (Date.now() - courseFoldersAt) < 600000) return courseFoldersCache;
+  const r = await fetch(WEBHOOK + '/disk.folder.getchildren.json?id=' + COURSE_SAMPLES_ROOT, { timeout: 15000 });
+  const j = await r.json();
+  const folders = (j.result || []).filter(x => x.TYPE === 'folder').map(x => ({ id: x.ID, name: x.NAME }));
+  if (folders.length) { courseFoldersCache = folders; courseFoldersAt = Date.now(); }
+  return folders;
+}
+function normName(s) { return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^0-9a-zа-я]+/gi, ''); }
+async function getChatFolderId(dialog) {
+  const r = await fetch(WEBHOOK + '/im.disk.folder.get.json?DIALOG_ID=' + encodeURIComponent(dialog), { timeout: 15000 });
+  const j = await r.json();
+  return j.result && j.result.ID;
+}
+async function sendChatPhoto(dialog, fileId, chatFolderId, caption) {
+  const cpr = await fetch(WEBHOOK + '/disk.file.copyto.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: fileId, targetFolderId: chatFolderId }), timeout: 30000 });
+  const cpj = await cpr.json();
+  const newId = cpj.result && cpj.result.ID;
+  if (!newId) return { ok: false, step: 'copyto', error: (cpj.error || 'copy failed') + (cpj.error_description ? ': ' + cpj.error_description : '') };
+  const body = { DIALOG_ID: dialog, FILE_ID: newId, MESSAGE: caption || '' };
+  const cmr = await fetch(WEBHOOK + '/im.disk.file.commit.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeout: 15000 });
+  const cmj = await cmr.json();
+  return { ok: !!(cmj.result), error: cmj.error ? (cmj.error + ': ' + (cmj.error_description || '')) : null };
+}
+// курс → папка → отправка картинок. course = имя папки (как в «образцы курсов»), n = сколько (макс 5)
+async function sendCoursePhotos(dialog, course, n, caption) {
+  const folders = await getCourseFolders();
+  if (!folders.length) return { error: 'не удалось прочитать «образцы курсов» (право disk у вебхука?)' };
+  const want = normName(course);
+  const folder = folders.find(f => normName(f.name) === want)
+    || folders.find(f => normName(f.name).indexOf(want) !== -1 || (want && want.indexOf(normName(f.name)) !== -1));
+  if (!folder) return { error: 'папка курса не найдена', course: course, available: folders.map(f => f.name) };
+  const lr = await fetch(WEBHOOK + '/disk.folder.getchildren.json?id=' + folder.id, { timeout: 15000 });
+  const lj = await lr.json();
+  const imgs = (lj.result || []).filter(x => x.TYPE === 'file' && /\.(jpe?g|png|webp)$/i.test(x.NAME || '')).slice(0, Math.min(n || 3, 5));
+  if (!imgs.length) return { error: 'в папке нет картинок', folder: folder.name };
+  const chatFolderId = await getChatFolderId(dialog);
+  if (!chatFolderId) return { error: 'нет папки чата (im.disk.folder.get)' };
+  const sent = [];
+  for (let i = 0; i < imgs.length; i++) {
+    const r = await sendChatPhoto(dialog, imgs[i].ID, chatFolderId, i === 0 ? (caption || '') : '');
+    sent.push({ name: imgs[i].NAME, ok: r.ok, error: r.error });
+    await new Promise(x => setTimeout(x, 800));
+  }
+  return { course: folder.name, dialog: dialog, sent: sent };
+}
+// ручной тест и точка вызова из n8n: /romeo-photos?dialog=chatNNNN&course=МикроПаве База&n=2&key=PHOTO_KEY
+app.get('/romeo-photos', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  const dialog = req.query.dialog, course = req.query.course;
+  const n = parseInt(req.query.n || '3', 10);
+  if (!dialog || !course) return res.status(400).json({ error: 'нужны ?dialog=chatNNNN&course=<имя папки курса>' });
+  try { const r = await sendCoursePhotos(dialog, course, n, req.query.caption || ''); res.json(r); }
+  catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
+// ============================================
 // STARTUP
 // ============================================
 app.listen(PORT, async () => {
