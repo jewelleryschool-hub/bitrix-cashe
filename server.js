@@ -2233,16 +2233,45 @@ if (process.env.NUDGE_MODE === 'send') {
 // ФОТО-ОБРАЗЦЫ: probe Диска + тест-отправка (шаг 1–2 реализации отправки фото)
 // Требует у вебхука право scope "disk". Read-only, кроме /photo-test (нужен ключ).
 // ============================================
-// просмотр Диска: без параметров — список хранилищ; ?folder=ID — содержимое папки; ?storage=ID — корень хранилища
+// просмотр Диска: без параметров — список хранилищ; ?path=образцы курсов/МикроПаве База — резолв по пути;
+// ?folder=ID — содержимое папки; ?storage=ID — корень хранилища
 app.get('/disk-probe', async (req, res) => {
   try {
     const map = function (x) { return { ID: x.ID, TYPE: x.TYPE, NAME: x.NAME, SIZE: x.SIZE, DOWNLOAD_URL: x.DOWNLOAD_URL || null, DETAIL_URL: x.DETAIL_URL || null }; };
-    if (req.query.folder) {
-      const r = await fetch(WEBHOOK + '/disk.folder.getchildren.json?id=' + encodeURIComponent(req.query.folder), { timeout: 15000 });
+    const children = async function (id) {
+      const r = await fetch(WEBHOOK + '/disk.folder.getchildren.json?id=' + encodeURIComponent(id), { timeout: 15000 });
       const j = await r.json();
-      const items = (j.result || []).map(map);
-      return res.json({ folder: req.query.folder, count: items.length, folders: items.filter(i => i.TYPE === 'folder'), files: items.filter(i => i.TYPE === 'file'), error: j.error, error_description: j.error_description });
+      return { items: (j.result || []), error: j.error, error_description: j.error_description };
+    };
+    const out = function (folderId, extra) {
+      return children(folderId).then(function (c) {
+        const items = c.items.map(map);
+        return res.json(Object.assign({ folder: folderId, count: items.length, folders: items.filter(i => i.TYPE === 'folder'), files: items.filter(i => i.TYPE === 'file'), error: c.error, error_description: c.error_description }, extra || {}));
+      });
+    };
+
+    if (req.query.path) {
+      const segs = String(req.query.path).split('/').map(s => s.trim()).filter(Boolean);
+      const sr = await fetch(WEBHOOK + '/disk.storage.getlist.json', { timeout: 15000 });
+      const sj = await sr.json();
+      if (sj.error) return res.json({ error: sj.error, error_description: sj.error_description, hint: 'возможно у вебхука нет права disk' });
+      let storages = sj.result || [];
+      storages = storages.filter(s => s.ENTITY_TYPE === 'common').concat(storages.filter(s => s.ENTITY_TYPE !== 'common'));
+      const trail = [];
+      for (const st of storages) {
+        let curId = st.ROOT_OBJECT_ID, ok = true;
+        for (const seg of segs) {
+          const c = await children(curId);
+          const hit = (c.items || []).find(k => k.TYPE === 'folder' && String(k.NAME).toLowerCase() === seg.toLowerCase());
+          if (!hit) { ok = false; break; }
+          curId = hit.ID;
+        }
+        if (ok) return out(curId, { resolved_path: req.query.path, storage: { ID: st.ID, NAME: st.NAME } });
+        trail.push(st.NAME);
+      }
+      return res.json({ error: 'PATH_NOT_FOUND', tried_storages: trail, hint: 'проверь точное написание папок (регистр не важен, но пробелы/буквы важны) или используй ?storage=ID и кликай по folders[].ID' });
     }
+    if (req.query.folder) return out(req.query.folder);
     if (req.query.storage) {
       const r = await fetch(WEBHOOK + '/disk.storage.getchildren.json?id=' + encodeURIComponent(req.query.storage), { timeout: 15000 });
       const j = await r.json();
@@ -2252,7 +2281,7 @@ app.get('/disk-probe', async (req, res) => {
     const r = await fetch(WEBHOOK + '/disk.storage.getlist.json', { timeout: 15000 });
     const j = await r.json();
     const st = (j.result || []).map(function (s) { return { ID: s.ID, NAME: s.NAME, ENTITY_TYPE: s.ENTITY_TYPE, ENTITY_ID: s.ENTITY_ID, ROOT_OBJECT_ID: s.ROOT_OBJECT_ID }; });
-    return res.json({ hint: 'дальше: /disk-probe?storage=<ID хранилища> или /disk-probe?folder=<ID папки> (ID папки берётся из folders[].ID)', storages: st, error: j.error, error_description: j.error_description });
+    return res.json({ hint: 'дальше: /disk-probe?path=образцы курсов/МикроПаве База (проще всего) либо ?storage=<ID> / ?folder=<ID>', storages: st, error: j.error, error_description: j.error_description });
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
@@ -2273,6 +2302,39 @@ app.get('/photo-test', async (req, res) => {
     const sr = await fetch(WEBHOOK + '/imbot.message.add.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeout: 15000 });
     const sj = await sr.json();
     res.json({ method: method, dialog: dialog, file: { ID: f.ID, NAME: f.NAME, DOWNLOAD_URL: url }, send_result: sj.result, error: sj.error, error_description: sj.error_description, note: 'send_result не значит «дошло до Instagram» — проверь в самом Instagram' });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
+// поиск открытого диалога → отдаёт готовый chatId. ?q=имя (по последним сессиям) или ?lead=ID (по лиду)
+app.get('/find-chat', async (req, res) => {
+  const q = String(req.query.q || '').toLowerCase().trim();
+  const lead = String(req.query.lead || '').trim();
+  try {
+    let acts = [];
+    let listErr = null;
+    if (lead) {
+      const r0 = await fetch(WEBHOOK + '/crm.activity.list.json?order[CREATED]=DESC&filter[OWNER_TYPE_ID]=1&filter[OWNER_ID]=' + encodeURIComponent(lead) + '&filter[PROVIDER_ID]=IMOPENLINES_SESSION&select[]=ID&select[]=SUBJECT&select[]=CREATED&select[]=ASSOCIATED_ENTITY_ID', { timeout: 15000 });
+      const j0 = await r0.json();
+      acts = (j0.result || []); listErr = j0.error;
+    } else {
+      const r0 = await fetch(WEBHOOK + '/crm.activity.list.json?order[CREATED]=DESC&filter[PROVIDER_ID]=IMOPENLINES_SESSION&select[]=ID&select[]=SUBJECT&select[]=CREATED&select[]=ASSOCIATED_ENTITY_ID&start=0', { timeout: 15000 });
+      const j0 = await r0.json();
+      acts = (j0.result || []); listErr = j0.error;
+      if (q) acts = acts.filter(a => String(a.SUBJECT || '').toLowerCase().indexOf(q) !== -1);
+    }
+    acts = acts.slice(0, 10);
+    const out = [];
+    for (const a of acts) {
+      let chatId = null;
+      try {
+        const rr = await fetch(WEBHOOK + '/imopenlines.session.history.get.json?SESSION_ID=' + encodeURIComponent(a.ASSOCIATED_ENTITY_ID), { timeout: 15000 });
+        const jj = await rr.json();
+        chatId = jj.result && jj.result.chatId;
+      } catch (e) { }
+      out.push({ session: a.ASSOCIATED_ENTITY_ID, name: a.SUBJECT, created: a.CREATED, chatId: chatId, dialog: chatId ? ('chat' + chatId) : null });
+      await new Promise(r => setTimeout(r, 300));
+    }
+    res.json({ query: q || null, lead: lead || null, count: out.length, dialogs: out, error: listErr });
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
