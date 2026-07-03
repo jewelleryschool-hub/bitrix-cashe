@@ -67,6 +67,42 @@ async function initSocratesTables() {
   }
 }
 
+// Инициализация таблицы разбора отчётов мастерской (Сократ, work_log)
+async function initWorkLogTable() {
+  if (!pgPool) return;
+  try {
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS work_log (
+        id BIGSERIAL PRIMARY KEY,
+        tg_report_id BIGINT,
+        work_date DATE,
+        master TEXT,
+        category TEXT,
+        object TEXT,
+        deal_id BIGINT,
+        operation TEXT,
+        business_unit TEXT,
+        day_fraction REAL,
+        confidence TEXT,
+        clarify BOOLEAN DEFAULT false,
+        clarify_question TEXT,
+        raw_text TEXT,
+        digest_date DATE,
+        created_at BIGINT NOT NULL,
+        UNIQUE(master, object, work_date, operation)
+      );
+      CREATE INDEX IF NOT EXISTS idx_wl_date ON work_log(work_date);
+      CREATE INDEX IF NOT EXISTS idx_wl_master ON work_log(master);
+      CREATE INDEX IF NOT EXISTS idx_wl_deal ON work_log(deal_id);
+      CREATE INDEX IF NOT EXISTS idx_wl_digest ON work_log(digest_date);
+    `);
+    console.log('✓ Таблица work_log готова');
+  } catch (err) {
+    console.log('⚠️ Ошибка инициализации work_log:', err.message);
+  }
+}
+
+
 
 // Хелперы для работы с Postgres кэшем
 async function pgSetCache(key, value) {
@@ -2452,6 +2488,255 @@ app.get('/socrates/reports', async (req, res) => {
   }
 });
 
+// ============================================
+// СОКРАТ: разбор отчётов мастерской через Claude (пакетно в 20:00 МСК)
+// Читает сырьё из tg_reports за дату, матчит к живым сделкам C46/C48/PlakhovArt,
+// раскладывает в work_log, помечает clarify для непонятных.
+// ============================================
+const SOCRATES_MASTER_MAP = {
+  // telegram author -> каноничное имя мастера (дополняется по мере знакомства)
+  'ERSHOV': 'Степан Ершов',
+  'Oleg': 'Олег Гиниборг'
+};
+
+// тянем открытые производственные сделки как контекст для матчинга
+async function socratesLoadDeals() {
+  const cats = [46, 48];
+  const out = [];
+  for (const cat of cats) {
+    let start = 0, guard = 0;
+    while (guard < 30) {
+      guard++;
+      const url = WEBHOOK + '/crm.deal.list.json?filter[CATEGORY_ID]=' + cat +
+        '&filter[CLOSED]=N&select[]=ID&select[]=TITLE&select[]=STAGE_ID&start=' + start;
+      let d = null;
+      try { const r = await fetch(url, { timeout: 15000 }); d = await r.json(); } catch (e) { break; }
+      if (!d || !Array.isArray(d.result)) break;
+      for (const deal of d.result) {
+        const m = String(deal.TITLE || '').match(/^#?\s*(\d{1,4})\b/);
+        out.push({ id: deal.ID, num: m ? m[1] : null, title: (deal.TITLE || '').slice(0, 60), cat: cat });
+      }
+      if (d.next && d.next > start) start = d.next; else break;
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+  return out;
+}
+
+// вычисление реальной даты работы по дню недели относительно даты сообщения
+function socratesResolveDate(dayWord, msgDateStr) {
+  const map = { 'пн': 1, 'вт': 2, 'ср': 3, 'чт': 4, 'пт': 5, 'сб': 6, 'вс': 0 };
+  const w = String(dayWord || '').toLowerCase().slice(0, 2);
+  if (!(w in map)) return msgDateStr.slice(0, 10);
+  const msg = new Date(msgDateStr);
+  const msgDow = msg.getUTCDay();
+  const target = map[w];
+  let diff = msgDow - target;
+  if (diff < 0) diff += 7;            // ближайший прошедший этот день недели
+  const d = new Date(msg.getTime() - diff * 86400000);
+  return d.toISOString().slice(0, 10);
+}
+
+async function socratesClaudeParse(reports, deals) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return { error: 'NO_KEY' };
+  const dealCatalog = deals.filter(d => d.num).map(d => d.num + '|' + d.title).join('\n');
+  const knownObjects = 'Ножи PlakhovArt: Адъютант, Гунгнир, Грач, Готика, Буля, Консул, Моисей. ' +
+    'Худож. проекты: Нуво, Папоротник, Брошка титан, Кошка, Львица, Подсолнух.';
+  const msgList = reports.map(r => r.id + ' :: ' + (r.author || '') + ' :: ' + (r.msg_date || '') + ' :: ' + (r.text || '').replace(/\n/g, ' / ')).join('\n');
+
+  const system = 'Ты — аналитик производства ювелирной мастерской KARAKURKCHI-PLAKHOV. ' +
+    'Разбираешь ежедневные отчёты мастеров из рабочего чата и раскладываешь их для учёта человеко-дней. ' +
+    'ВХОД: строки формата "reportId :: автор :: датаISO :: текст" (перевод строки в тексте заменён на " / "). ' +
+    'КОНТЕКСТ — открытые производственные сделки (формат "номер|название"):\n' + dealCatalog + '\n' + knownObjects + '\n\n' +
+    'ПРАВИЛА:\n' +
+    '1. Многострочный отчёт ("Ср: 221 / Чт: 221 / Пт: уборка") — ЭТО НЕСКОЛЬКО ЗАПИСЕЙ, по одной на день. Дата работы = реальная дата по дню недели, НЕ дата сообщения.\n' +
+    '2. Категории: deal (заказ C46/C48 по номеру), plakhov (нож/худож.проект), teaching (курс/преподавание), orgwork (уборка/оргработа/битрикс), absence (отпуск/болезнь/выходной), ignore (болтовня/приветствие/не отчёт).\n' +
+    '3. object: номер заказа ("221") или название ножа/проекта или курс. deal_num: номер сделки если это deal, иначе null.\n' +
+    '4. operation: закрепка/монтировка/литьё/полировка/эскиз/выборка фона/уборка и т.п. Если не указана — null.\n' +
+    '5. business_unit: school (преподавание), brand (заказы, ножи, худож.), common (оргработа, отпуск).\n' +
+    '6. day_fraction: по умолчанию 1.0 (один объект = весь день). Если в ОДИН день у одного мастера НЕСКОЛЬКО объектов — day_fraction=null и clarify=true (спросить распределение). Разные дни — каждый 1.0.\n' +
+    '7. confidence: high (объект и операция ясны), medium (объект ясен, операция нет), low (объект неоднозначен).\n' +
+    '8. clarify=true если: операция не указана для deal/plakhov; объект неоднозначен; несколько объектов в день. clarify_question — короткий вопрос мастеру по-русски с обращением по имени.\n' +
+    '9. Строки категории ignore не порождают записей work_log вообще.\n' +
+    '10. Дедуп: если один мастер в один день по одному объекту — одна запись, даже если сырьё дублируется.\n\n' +
+    'ВЕРНИ СТРОГО JSON-массив, по объекту на КАЖДУЮ запись work_log (не на входное сообщение): ' +
+    '{"tg_report_id":число, "work_date":"YYYY-MM-DD", "master":"имя", "category":"...", "object":"... или null", "deal_num":"... или null", "operation":"... или null", "business_unit":"...", "day_fraction":число или null, "confidence":"...", "clarify":true/false, "clarify_question":"... или null", "raw_text":"исходная строка"}. ' +
+    'Только JSON, без пояснений и markdown.';
+
+  const model = process.env.ANALYSIS_MODEL || 'claude-opus-4-8';
+  try {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: model, max_tokens: 4000, system: system, messages: [{ role: 'user', content: 'Отчёты:\n' + msgList }] }),
+      timeout: 120000
+    });
+    const data = await resp.json();
+    let text = '';
+    if (data && Array.isArray(data.content)) text = data.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    if (!text) return { error: (data && data.error && data.error.message) || 'empty response' };
+    text = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    const parsed = JSON.parse(text);
+    return { records: Array.isArray(parsed) ? parsed : [] };
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
+}
+
+async function computeSocratesDigest(dateStr) {
+  const digestKey = 'socrates_digest_' + dateStr;
+  if (!pgPool) return { error: 'postgres disabled' };
+  try {
+    // сырьё за дату (по дате сообщения; многодневные отчёты раскидает разбор)
+    const from = Math.floor(new Date(dateStr + 'T00:00:00+03:00').getTime() / 1000);
+    const to = Math.floor(new Date(dateStr + 'T23:59:59+03:00').getTime() / 1000);
+    const r = await pgPool.query(
+      'SELECT id, author_name AS author, text, msg_date FROM tg_reports WHERE msg_date >= $1 AND msg_date <= $2 ORDER BY id ASC',
+      [from, to]
+    );
+    const reports = r.rows.map(x => ({
+      id: x.id, author: x.author,
+      msg_date: new Date(x.msg_date * 1000).toISOString(),
+      text: x.text || ''
+    }));
+    if (!reports.length) {
+      const empty = { date: dateStr, reports: 0, records: [], clarifications: [], note: 'нет сообщений за эту дату' };
+      cache[digestKey] = empty; lastUpdate[digestKey] = Date.now();
+      return empty;
+    }
+    const deals = await socratesLoadDeals();
+    const parsed = await socratesClaudeParse(reports, deals);
+    if (parsed.error) { const e = { date: dateStr, error: parsed.error }; cache[digestKey] = e; lastUpdate[digestKey] = Date.now(); return e; }
+
+    const dealByNum = {};
+    for (const d of deals) if (d.num) dealByNum[d.num] = d.id;
+
+    const records = parsed.records.filter(rec => rec.category !== 'ignore');
+    let written = 0;
+    for (const rec of records) {
+      const dealId = rec.deal_num && dealByNum[rec.deal_num] ? dealByNum[rec.deal_num] : null;
+      try {
+        await pgPool.query(
+          `INSERT INTO work_log(tg_report_id, work_date, master, category, object, deal_id, operation, business_unit, day_fraction, confidence, clarify, clarify_question, raw_text, digest_date, created_at)
+           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+           ON CONFLICT(master, object, work_date, operation) DO UPDATE SET
+             day_fraction=EXCLUDED.day_fraction, confidence=EXCLUDED.confidence,
+             clarify=EXCLUDED.clarify, clarify_question=EXCLUDED.clarify_question`,
+          [rec.tg_report_id || null, rec.work_date || dateStr, rec.master || null, rec.category || null,
+           rec.object || null, dealId, rec.operation || null, rec.business_unit || null,
+           rec.day_fraction === undefined ? 1.0 : rec.day_fraction, rec.confidence || null,
+           !!rec.clarify, rec.clarify_question || null, rec.raw_text || null, dateStr, Date.now()]
+        );
+        written++;
+      } catch (e) { console.log('⚠️ work_log insert:', e.message); }
+    }
+
+    const clarifications = records.filter(rec => rec.clarify && rec.clarify_question)
+      .map(rec => ({ master: rec.master, question: rec.clarify_question, object: rec.object }));
+
+    const result = {
+      date: dateStr, reports: reports.length, parsed: records.length, written: written,
+      records: records, clarifications: clarifications, updatedAt: new Date().toISOString()
+    };
+    cache[digestKey] = result; lastUpdate[digestKey] = Date.now();
+    return result;
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
+}
+
+// отправка уточняющих вопросов в группу мастерской (под флагом SOCRATES_ASK)
+async function socratesSendQuestions(digest) {
+  if (process.env.SOCRATES_ASK !== 'on') return { sent: 0, reason: 'SOCRATES_ASK выключен' };
+  if (!digest || !digest.clarifications || !digest.clarifications.length) return { sent: 0, reason: 'нет вопросов' };
+  if (!TG_SOCRATES_TOKEN) return { sent: 0, reason: 'нет токена' };
+  let sent = 0;
+  for (const c of digest.clarifications) {
+    const text = c.question;
+    try {
+      const url = 'https://api.telegram.org/bot' + TG_SOCRATES_TOKEN + '/sendMessage';
+      const r = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: TG_SOCRATES_CHAT, text: text }), timeout: 15000
+      });
+      const j = await r.json();
+      if (j && j.ok) sent++;
+    } catch (e) { console.log('⚠️ socrates ask:', e.message); }
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return { sent: sent };
+}
+
+
+// эндпоинт: запустить/показать разбор за дату. /socrates/digest?date=YYYY-MM-DD
+// без date — за сегодня (МСК). &run=1 — принудительно пересчитать.
+app.get('/socrates/digest', async (req, res) => {
+  const mskNow = new Date(Date.now() + 3 * 3600000);
+  const date = req.query.date || mskNow.toISOString().slice(0, 10);
+  const digestKey = 'socrates_digest_' + date;
+  const wantRun = req.query.run === '1' || !cache[digestKey];
+  if (wantRun) {
+    const result = await computeSocratesDigest(date);
+    if (req.query.ask === '1' && !result.error) {
+      result.ask_result = await socratesSendQuestions(result);
+    }
+    return res.json(result);
+  }
+  return res.json(cache[digestKey]);
+});
+
+// эндпоинт: человеко-дни по объектам за период. /socrates/workload?days=30
+app.get('/socrates/workload', async (req, res) => {
+  if (!pgPool) return res.json({ error: 'postgres disabled' });
+  const days = Math.min(parseInt(req.query.days || '30', 10), 365);
+  const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  try {
+    const byObject = await pgPool.query(
+      `SELECT object, category, COUNT(DISTINCT master||work_date) AS person_days, SUM(day_fraction) AS total_fraction
+       FROM work_log WHERE work_date >= $1 AND category IN ('deal','plakhov')
+       GROUP BY object, category ORDER BY total_fraction DESC NULLS LAST LIMIT 100`, [since]);
+    const byMaster = await pgPool.query(
+      `SELECT master, category, SUM(day_fraction) AS days
+       FROM work_log WHERE work_date >= $1 GROUP BY master, category ORDER BY master, days DESC`, [since]);
+    const byUnit = await pgPool.query(
+      `SELECT business_unit, SUM(day_fraction) AS days
+       FROM work_log WHERE work_date >= $1 GROUP BY business_unit`, [since]);
+    res.json({
+      period_days: days, since: since,
+      by_object: byObject.rows,
+      by_master: byMaster.rows,
+      by_business_unit: byUnit.rows,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
+// планировщик: разбор в 20:00 МСК = 17:00 UTC, только если SOCRATES_DIGEST=on
+let socratesLastRun = null;
+if (process.env.SOCRATES_DIGEST === 'on') {
+  setInterval(async function () {
+    const utc = new Date();
+    const h = utc.getUTCHours(), m = utc.getUTCMinutes();
+    const todayMsk = new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 10);
+    if (h === 17 && m < 5 && socratesLastRun !== todayMsk) {
+      socratesLastRun = todayMsk;
+      console.log('🕗 Сократ: разбор дня', todayMsk);
+      try {
+        const digest = await computeSocratesDigest(todayMsk);
+        if (!digest.error) {
+          const ask = await socratesSendQuestions(digest);
+          console.log('✓ Сократ: записей', digest.written, '| вопросов отправлено', ask.sent || 0);
+        } else {
+          console.log('⚠️ Сократ digest error:', digest.error);
+        }
+      } catch (e) { console.log('⚠️ Сократ scheduler:', e.message); }
+    }
+  }, 60 * 1000);
+  console.log('🕗 Сократ-планировщик ON (разбор в 20:00 МСК)');
+}
+
+
 app.get('/find-chat', async (req, res) => {
   const q = String(req.query.q || '').toLowerCase().trim();
   const lead = String(req.query.lead || '').trim();
@@ -2553,6 +2838,7 @@ app.listen(PORT, async () => {
   if (pgReady) {
     await initPgCache();
     await initSocratesTables();
+    await initWorkLogTable();
     await pgLoadAllIntoMemory(cache);
     console.log('✓ Postgres кэш загружен в память');
   } else {
