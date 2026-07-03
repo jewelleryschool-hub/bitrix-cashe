@@ -2565,23 +2565,35 @@ async function socratesClaudeParse(reports, deals) {
     'Только JSON, без пояснений и markdown.';
 
   const model = process.env.ANALYSIS_MODEL || 'claude-opus-4-8';
-  try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: model, max_tokens: 4000, system: system, messages: [{ role: 'user', content: 'Отчёты:\n' + msgList }] }),
-      timeout: 120000
-    });
-    const data = await resp.json();
-    let text = '';
-    if (data && Array.isArray(data.content)) text = data.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
-    if (!text) return { error: (data && data.error && data.error.message) || 'empty response' };
-    text = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-    const parsed = JSON.parse(text);
-    return { records: Array.isArray(parsed) ? parsed : [] };
-  } catch (e) {
-    return { error: String((e && e.message) || e) };
+  const body = JSON.stringify({ model: model, max_tokens: 4000, system: system, messages: [{ role: 'user', content: 'Отчёты:\n' + msgList }] });
+  // до 3 попыток: Opus на большом контексте иногда отдаёт "Premature close" — повторяем
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+        body: body,
+        timeout: 300000
+      });
+      const data = await resp.json();
+      let text = '';
+      if (data && Array.isArray(data.content)) text = data.content.filter(b => b.type === 'text').map(b => b.text).join('').trim();
+      if (!text) {
+        lastErr = (data && data.error && data.error.message) || 'empty response';
+        if (data && data.error) return { error: lastErr };
+        continue;
+      }
+      text = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+      const parsed = JSON.parse(text);
+      return { records: Array.isArray(parsed) ? parsed : [] };
+    } catch (e) {
+      lastErr = String((e && e.message) || e);
+      console.log('⚠️ socratesClaudeParse попытка ' + attempt + ':', lastErr);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 3000));
+    }
   }
+  return { error: lastErr || 'unknown' };
 }
 
 async function computeSocratesDigest(dateStr) {
