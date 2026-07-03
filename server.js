@@ -1,5 +1,13 @@
 const express = require('express');
-const fetch = require('node-fetch');
+// Нативный fetch Node 18+ вместо node-fetch (старый node-fetch давал "Premature close"
+// на новом рантайме Railway). Обёртка транслирует опцию timeout в AbortSignal,
+// чтобы все существующие вызовы fetch(url, { timeout: N }) работали без правок.
+const fetch = (url, opts) => {
+  const o = Object.assign({}, opts || {});
+  if (o.timeout && !o.signal) o.signal = AbortSignal.timeout(o.timeout);
+  delete o.timeout;
+  return globalThis.fetch(url, o);
+};
 
 // ============================================
 // POSTGRES CACHE (опционально, с грациозной деградацией)
