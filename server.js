@@ -2502,13 +2502,28 @@ app.get('/socrates/reports', async (req, res) => {
 // раскладывает в work_log, помечает clarify для непонятных.
 // ============================================
 const SOCRATES_MASTER_MAP = {
-  // telegram author -> { name: каноничное имя, call: обращение в вопросах }
+  // каноничное имя -> { call: обращение, aliases: варианты написания в Telegram (ник/имя/фамилия, лат/кир) }
   // это же — ростер мастеров, от которых ждём ежедневный отчёт (кроме выходных)
-  'ERSHOV': { name: 'Степан Ершов', call: 'Степан' },
-  'Oleg': { name: 'Олег Гиниборг', call: 'Олег' },
-  'Игорь Деменцов': { name: 'Игорь Деменцов', call: 'Игорь' },
-  'Володя Плахов': { name: 'Володя Плахов', call: 'Володя' }
+  'Степан Ершов': { call: 'Степан', aliases: ['ershov', 'степан', 'ершов', 'stepan'] },
+  'Олег Гиниборг': { call: 'Олег', aliases: ['oleg', 'олег', 'гиниборг'] },
+  'Игорь Деменцов': { call: 'Игорь', aliases: ['игорь', 'деменцов', 'igor'] },
+  'Витя Комисар': { call: 'Витя', aliases: ['viktor', 'витя', 'виктор', 'комисар', 'komisar'] },
+  'Кристина Спасская': { call: 'Кристина', aliases: ['кристина', 'спасская', 'kristina'] },
+  'Володя Плахов': { call: 'Володя', aliases: ['володя', 'плахов', 'vladimir', 'volodya', 'plakhov'] }
 };
+
+// устойчивое сопоставление telegram-автора с мастером (без регистра, по подстроке алиаса)
+function socratesMasterOf(author) {
+  const a = String(author || '').toLowerCase().trim();
+  if (!a) return null;
+  for (const name of Object.keys(SOCRATES_MASTER_MAP)) {
+    const m = SOCRATES_MASTER_MAP[name];
+    for (const al of m.aliases) {
+      if (a.indexOf(al) !== -1) return { name: name, call: m.call };
+    }
+  }
+  return null;
+}
 
 // тянем открытые производственные сделки как контекст для матчинга
 async function socratesLoadDeals() {
@@ -2555,7 +2570,8 @@ async function socratesClaudeParse(reports, deals) {
   const knownObjects = 'Ножи PlakhovArt: Адъютант, Гунгнир, Грач, Готика, Буля, Консул, Моисей. ' +
     'Худож. проекты: Нуво, Папоротник, Брошка титан, Кошка, Львица, Подсолнух.';
   const namesLine = 'Обращения к мастерам в вопросах: ' +
-    Object.entries(SOCRATES_MASTER_MAP).map(([tg, m]) => tg + ' = ' + m.call).join(', ') + '.';
+    Object.entries(SOCRATES_MASTER_MAP).map(([name, m]) => name + ' = ' + m.call).join(', ') +
+    '. Автор в отчёте может быть написан ником или сокращённо (ERSHOV, Oleg, Viktor K) — соотнеси с мастером по смыслу.';
   const msgList = reports.map(r => r.id + ' :: ' + (r.author || '') + ' :: ' + (r.msg_date || '') + ' :: ' + (r.text || '').replace(/\n/g, ' / ')).join('\n');
 
   const system = 'Ты — аналитик производства ювелирной мастерской KARAKURKCHI-PLAKHOV. ' +
@@ -2676,13 +2692,16 @@ async function computeSocratesDigest(dateStr) {
     const isWeekend = (dow === 0 || dow === 6);
     const missing = [];
     if (!isWeekend) {
-      const seenAuthors = {};
-      for (const r of reports) seenAuthors[r.author || ''] = true;
-      for (const tgName of Object.keys(SOCRATES_MASTER_MAP)) {
-        if (!seenAuthors[tgName]) {
-          const m = SOCRATES_MASTER_MAP[tgName];
-          missing.push(m.name);
-          clarifications.push({ master: m.name, question: m.call + ', не вижу отчёта за сегодня — что было в работе?', object: null });
+      const seenMasters = {};
+      for (const r of reports) {
+        const m = socratesMasterOf(r.author);
+        if (m) seenMasters[m.name] = true;
+      }
+      for (const name of Object.keys(SOCRATES_MASTER_MAP)) {
+        if (!seenMasters[name]) {
+          const m = SOCRATES_MASTER_MAP[name];
+          missing.push(name);
+          clarifications.push({ master: name, question: m.call + ', не вижу отчёта за сегодня — что было в работе?', object: null });
         }
       }
     }
