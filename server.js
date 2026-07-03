@@ -40,6 +40,34 @@ async function initPgCache() {
   }
 }
 
+// Инициализация таблицы отчётов мастерской (Сократ)
+async function initSocratesTables() {
+  if (!pgPool) return;
+  try {
+    await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS tg_reports (
+        id BIGSERIAL PRIMARY KEY,
+        update_id BIGINT UNIQUE,
+        message_id BIGINT,
+        chat_id BIGINT NOT NULL,
+        author_id BIGINT,
+        author_name TEXT,
+        text TEXT,
+        msg_date BIGINT,
+        raw JSONB,
+        created_at BIGINT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_tgr_chat ON tg_reports(chat_id);
+      CREATE INDEX IF NOT EXISTS idx_tgr_date ON tg_reports(msg_date);
+      CREATE INDEX IF NOT EXISTS idx_tgr_author ON tg_reports(author_id);
+    `);
+    console.log('✓ Таблица tg_reports готова');
+  } catch (err) {
+    console.log('⚠️ Ошибка инициализации tg_reports:', err.message);
+  }
+}
+
+
 // Хелперы для работы с Postgres кэшем
 async function pgSetCache(key, value) {
   if (!pgPool) return;
@@ -2339,6 +2367,91 @@ app.get('/text-test', async (req, res) => {
 });
 
 
+
+// ============================================
+// СОКРАТ: приём сообщений группы мастерской из Telegram
+// Вебхук Telegram шлёт сюда каждое сообщение. Пишем сырьё в tg_reports.
+// Защита: секретный заголовок Telegram + фильтр по chat_id группы.
+// ============================================
+const TG_SOCRATES_TOKEN = process.env.TG_SOCRATES_TOKEN || '';
+const TG_SOCRATES_SECRET = process.env.TG_SOCRATES_SECRET || '';
+const TG_SOCRATES_CHAT = process.env.TG_SOCRATES_CHAT || '-1004300239646';
+
+app.post('/socrates/tg', async (req, res) => {
+  // 1) проверка секрета Telegram (заголовок задаётся при setWebhook)
+  if (TG_SOCRATES_SECRET) {
+    const got = req.headers['x-telegram-bot-api-secret-token'];
+    if (got !== TG_SOCRATES_SECRET) {
+      console.log('⚠️ socrates/tg: неверный секрет');
+      return res.sendStatus(403);
+    }
+  }
+  // Telegram ждёт быстрый 200, иначе ретраит — отвечаем сразу
+  res.sendStatus(200);
+
+  try {
+    const upd = req.body || {};
+    const msg = upd.message || upd.edited_message || upd.channel_post;
+    if (!msg) return;
+
+    const chatId = msg.chat && msg.chat.id;
+    // 2) фильтр: принимаем только нашу группу
+    if (String(chatId) !== String(TG_SOCRATES_CHAT)) {
+      console.log('ℹ️ socrates/tg: чужой chat_id', chatId, '— игнор');
+      return;
+    }
+
+    const text = msg.text || msg.caption || '';
+    const from = msg.from || {};
+    const authorName = [from.first_name, from.last_name].filter(Boolean).join(' ') || (from.username || '');
+
+    if (!pgPool) { console.log('ℹ️ socrates/tg: Postgres выкл, сообщение не сохранено'); return; }
+
+    await pgPool.query(
+      `INSERT INTO tg_reports(update_id, message_id, chat_id, author_id, author_name, text, msg_date, raw, created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       ON CONFLICT(update_id) DO NOTHING`,
+      [
+        upd.update_id || null,
+        msg.message_id || null,
+        chatId,
+        from.id || null,
+        authorName,
+        text,
+        msg.date || null,
+        JSON.stringify(msg),
+        Date.now()
+      ]
+    );
+    console.log('✓ tg_reports +1:', authorName, '|', text.slice(0, 60));
+  } catch (err) {
+    console.log('⚠️ socrates/tg error:', err.message);
+  }
+});
+
+// Просмотр последних сохранённых отчётов (проверка, что приём работает)
+// /socrates/reports?limit=30
+app.get('/socrates/reports', async (req, res) => {
+  if (!pgPool) return res.json({ error: 'postgres disabled' });
+  const limit = Math.min(parseInt(req.query.limit || '30', 10), 200);
+  try {
+    const r = await pgPool.query(
+      'SELECT message_id, author_name, text, msg_date FROM tg_reports ORDER BY id DESC LIMIT $1',
+      [limit]
+    );
+    res.json({
+      count: r.rows.length,
+      reports: r.rows.map(x => ({
+        author: x.author_name,
+        text: x.text,
+        date: x.msg_date ? new Date(x.msg_date * 1000).toISOString() : null
+      }))
+    });
+  } catch (e) {
+    res.status(500).json({ error: String((e && e.message) || e) });
+  }
+});
+
 app.get('/find-chat', async (req, res) => {
   const q = String(req.query.q || '').toLowerCase().trim();
   const lead = String(req.query.lead || '').trim();
@@ -2439,6 +2552,7 @@ app.listen(PORT, async () => {
   console.log('Bitrix Cache Server running on port', PORT);
   if (pgReady) {
     await initPgCache();
+    await initSocratesTables();
     await pgLoadAllIntoMemory(cache);
     console.log('✓ Postgres кэш загружен в память');
   } else {
