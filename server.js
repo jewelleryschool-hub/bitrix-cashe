@@ -2580,7 +2580,8 @@ async function socratesClaudeParse(reports, deals) {
     'КОНТЕКСТ — открытые производственные сделки (формат "номер|название"):\n' + dealCatalog + '\n' + knownObjects + '\n' + namesLine + '\n\n' +
     'ПРАВИЛА:\n' +
     '1. Многострочный отчёт ("Ср: 221 / Чт: 221 / Пт: уборка") — ЭТО НЕСКОЛЬКО ЗАПИСЕЙ, по одной на день. Дата работы = реальная дата по дню недели, НЕ дата сообщения.\n' +
-    '2. Категории: deal (заказ C46/C48 по номеру), plakhov (нож/худож.проект), teaching (курс/преподавание), orgwork (уборка/оргработа/битрикс), absence (отпуск/болезнь/выходной), ignore (болтовня/приветствие/не отчёт).\n' +
+    '2. Категории: deal (заказ C46/C48 по номеру), plakhov (нож/худож.проект), teaching (курс/преподавание), orgwork (уборка/оргработа/битрикс/корпоратив/бытовые дела мастерской), absence (отпуск/болезнь/выходной), ignore (приветствия/реакции/болтовня БЕЗ описания занятости).\n' +
+    '2а. ВАЖНО: если мастер описывает, чем занимался — это ВСЕГДА отчёт, даже если занятие бытовое ("праздновали день рождения, мыл посуду" = orgwork, операция "корпоратив"). День мастера не должен пропасть из учёта. ignore — только для сообщений вообще без занятости.\n' +
     '3. object: номер заказа ("221") или название ножа/проекта или курс. deal_num: номер сделки если это deal, иначе null.\n' +
     '4. operation: закрепка/монтировка/литьё/полировка/эскиз/выборка фона/уборка и т.п. Если не указана — null.\n' +
     '5. business_unit: school (преподавание), brand (заказы, ножи, худож.), common (оргработа, отпуск).\n' +
@@ -2718,9 +2719,10 @@ async function computeSocratesDigest(dateStr) {
   }
 }
 
-// отправка уточняющих вопросов в группу мастерской (под флагом SOCRATES_ASK)
-async function socratesSendQuestions(digest) {
-  if (process.env.SOCRATES_ASK !== 'on') return { sent: 0, reason: 'SOCRATES_ASK выключен' };
+// отправка уточняющих вопросов в группу мастерской
+// force=true (ручной &ask=1) — отправляет всегда; иначе только при SOCRATES_ASK=on (планировщик)
+async function socratesSendQuestions(digest, force) {
+  if (!force && process.env.SOCRATES_ASK !== 'on') return { sent: 0, reason: 'SOCRATES_ASK выключен' };
   if (!digest || !digest.clarifications || !digest.clarifications.length) return { sent: 0, reason: 'нет вопросов' };
   if (!TG_SOCRATES_TOKEN) return { sent: 0, reason: 'нет токена' };
   let sent = 0;
@@ -2748,14 +2750,11 @@ app.get('/socrates/digest', async (req, res) => {
   const date = req.query.date || mskNow.toISOString().slice(0, 10);
   const digestKey = 'socrates_digest_' + date;
   const wantRun = req.query.run === '1' || !cache[digestKey];
-  if (wantRun) {
-    const result = await computeSocratesDigest(date);
-    if (req.query.ask === '1' && !result.error) {
-      result.ask_result = await socratesSendQuestions(result);
-    }
-    return res.json(result);
+  const result = wantRun ? await computeSocratesDigest(date) : cache[digestKey];
+  if (req.query.ask === '1' && result && !result.error) {
+    result.ask_result = await socratesSendQuestions(result, true);
   }
-  return res.json(cache[digestKey]);
+  return res.json(result);
 });
 
 // эндпоинт: человеко-дни по объектам за период. /socrates/workload?days=30
@@ -2784,7 +2783,49 @@ app.get('/socrates/workload', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
-// планировщик: разбор в 20:00 МСК = 17:00 UTC, только если SOCRATES_DIGEST=on
+// месячный отчёт: кто чем занимался. /socrates/month?month=YYYY-MM (&master=Степан — только один мастер)
+app.get('/socrates/month', async (req, res) => {
+  if (!pgPool) return res.json({ error: 'postgres disabled' });
+  const month = req.query.month || new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 7);
+  const from = month + '-01';
+  const to = month + '-31';
+  const masterFilter = req.query.master ? ' AND master ILIKE $3' : '';
+  const params = req.query.master ? [from, to, '%' + req.query.master + '%'] : [from, to];
+  try {
+    const r = await pgPool.query(
+      `SELECT master, category, object, operation,
+              COUNT(*) AS entries, SUM(COALESCE(day_fraction, 0)) AS days,
+              COUNT(*) FILTER (WHERE day_fraction IS NULL) AS unresolved
+       FROM work_log
+       WHERE work_date >= $1 AND work_date <= $2 AND category <> 'ignore'${masterFilter}
+       GROUP BY master, category, object, operation
+       ORDER BY master, days DESC NULLS LAST`, params);
+    // группируем по мастеру: итог дней + раскладка занятий
+    const byMaster = {};
+    for (const row of r.rows) {
+      const m = row.master || '(неизвестный)';
+      if (!byMaster[m]) byMaster[m] = { total_days: 0, unresolved_entries: 0, activities: [] };
+      byMaster[m].total_days += Number(row.days || 0);
+      byMaster[m].unresolved_entries += Number(row.unresolved || 0);
+      byMaster[m].activities.push({
+        category: row.category,
+        object: row.object,
+        operation: row.operation,
+        days: Number(row.days || 0),
+        entries: Number(row.entries)
+      });
+    }
+    for (const m of Object.keys(byMaster)) byMaster[m].total_days = Math.round(byMaster[m].total_days * 10) / 10;
+    res.json({
+      month: month,
+      masters: byMaster,
+      note: 'days — учтённые человеко-дни; unresolved_entries — записи без распределения дня (day_fraction null, ждут уточнения). ignore не входит.',
+      updatedAt: new Date().toISOString()
+    });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
+
 let socratesLastRun = null;
 if (process.env.SOCRATES_DIGEST === 'on') {
   setInterval(async function () {
