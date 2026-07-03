@@ -2502,9 +2502,12 @@ app.get('/socrates/reports', async (req, res) => {
 // раскладывает в work_log, помечает clarify для непонятных.
 // ============================================
 const SOCRATES_MASTER_MAP = {
-  // telegram author -> каноничное имя мастера (дополняется по мере знакомства)
-  'ERSHOV': 'Степан Ершов',
-  'Oleg': 'Олег Гиниборг'
+  // telegram author -> { name: каноничное имя, call: обращение в вопросах }
+  // это же — ростер мастеров, от которых ждём ежедневный отчёт (кроме выходных)
+  'ERSHOV': { name: 'Степан Ершов', call: 'Степан' },
+  'Oleg': { name: 'Олег Гиниборг', call: 'Олег' },
+  'Игорь Деменцов': { name: 'Игорь Деменцов', call: 'Игорь' },
+  'Володя Плахов': { name: 'Володя Плахов', call: 'Володя' }
 };
 
 // тянем открытые производственные сделки как контекст для матчинга
@@ -2551,12 +2554,14 @@ async function socratesClaudeParse(reports, deals) {
   const dealCatalog = deals.filter(d => d.num).map(d => d.num + '|' + d.title).join('\n');
   const knownObjects = 'Ножи PlakhovArt: Адъютант, Гунгнир, Грач, Готика, Буля, Консул, Моисей. ' +
     'Худож. проекты: Нуво, Папоротник, Брошка титан, Кошка, Львица, Подсолнух.';
+  const namesLine = 'Обращения к мастерам в вопросах: ' +
+    Object.entries(SOCRATES_MASTER_MAP).map(([tg, m]) => tg + ' = ' + m.call).join(', ') + '.';
   const msgList = reports.map(r => r.id + ' :: ' + (r.author || '') + ' :: ' + (r.msg_date || '') + ' :: ' + (r.text || '').replace(/\n/g, ' / ')).join('\n');
 
   const system = 'Ты — аналитик производства ювелирной мастерской KARAKURKCHI-PLAKHOV. ' +
     'Разбираешь ежедневные отчёты мастеров из рабочего чата и раскладываешь их для учёта человеко-дней. ' +
     'ВХОД: строки формата "reportId :: автор :: датаISO :: текст" (перевод строки в тексте заменён на " / "). ' +
-    'КОНТЕКСТ — открытые производственные сделки (формат "номер|название"):\n' + dealCatalog + '\n' + knownObjects + '\n\n' +
+    'КОНТЕКСТ — открытые производственные сделки (формат "номер|название"):\n' + dealCatalog + '\n' + knownObjects + '\n' + namesLine + '\n\n' +
     'ПРАВИЛА:\n' +
     '1. Многострочный отчёт ("Ср: 221 / Чт: 221 / Пт: уборка") — ЭТО НЕСКОЛЬКО ЗАПИСЕЙ, по одной на день. Дата работы = реальная дата по дню недели, НЕ дата сообщения.\n' +
     '2. Категории: deal (заказ C46/C48 по номеру), plakhov (нож/худож.проект), teaching (курс/преподавание), orgwork (уборка/оргработа/битрикс), absence (отпуск/болезнь/выходной), ignore (болтовня/приветствие/не отчёт).\n' +
@@ -2567,7 +2572,9 @@ async function socratesClaudeParse(reports, deals) {
     '7. confidence: high (объект и операция ясны), medium (объект ясен, операция нет), low (объект неоднозначен).\n' +
     '8. clarify=true если: операция не указана для deal/plakhov; объект неоднозначен; несколько объектов в день. clarify_question — короткий вопрос мастеру по-русски с обращением по имени.\n' +
     '9. Строки категории ignore не порождают записей work_log вообще.\n' +
-    '10. Дедуп: если один мастер в один день по одному объекту — одна запись, даже если сырьё дублируется.\n\n' +
+    '10. Дедуп: если один мастер в один день по одному объекту — одна запись, даже если сырьё дублируется.\n' +
+    '11. В clarify_question обращайся по ИМЕНИ из карты обращений (Степан, Олег...), не по фамилии и не по telegram-нику.\n' +
+    '12. СКЛЕЙКА ВОПРОСОВ: если у одного мастера по одному объекту несколько дней без операции — сформулируй ОДИН общий вопрос на все дни ("Степан, по 221 в ср-чт что делал?") и продублируй этот же текст в clarify_question каждой из этих записей. Не задавай отдельный вопрос на каждый день.\n\n' +
     'ВЕРНИ СТРОГО JSON-массив, по объекту на КАЖДУЮ запись work_log (не на входное сообщение): ' +
     '{"tg_report_id":число, "work_date":"YYYY-MM-DD", "master":"имя", "category":"...", "object":"... или null", "deal_num":"... или null", "operation":"... или null", "business_unit":"...", "day_fraction":число или null, "confidence":"...", "clarify":true/false, "clarify_question":"... или null", "raw_text":"исходная строка"}. ' +
     'Только JSON, без пояснений и markdown.';
@@ -2652,11 +2659,37 @@ async function computeSocratesDigest(dateStr) {
       } catch (e) { console.log('⚠️ work_log insert:', e.message); }
     }
 
-    const clarifications = records.filter(rec => rec.clarify && rec.clarify_question)
-      .map(rec => ({ master: rec.master, question: rec.clarify_question, object: rec.object }));
+    // вопросы: дедуп по тексту (склеенный вопрос дублируется в нескольких записях)
+    const seenQ = {};
+    const clarifications = [];
+    for (const rec of records) {
+      if (!rec.clarify || !rec.clarify_question) continue;
+      const qkey = (rec.master || '') + '|' + rec.clarify_question;
+      if (seenQ[qkey]) continue;
+      seenQ[qkey] = true;
+      clarifications.push({ master: rec.master, question: rec.clarify_question, object: rec.object });
+    }
+
+    // контроль "нет отчёта": в будни напоминаем молчунам из ростера, в сб/вс — не напоминаем
+    // (но присланные в выходные отчёты разобраны выше как обычно)
+    const dow = new Date(dateStr + 'T12:00:00Z').getUTCDay();
+    const isWeekend = (dow === 0 || dow === 6);
+    const missing = [];
+    if (!isWeekend) {
+      const seenAuthors = {};
+      for (const r of reports) seenAuthors[r.author || ''] = true;
+      for (const tgName of Object.keys(SOCRATES_MASTER_MAP)) {
+        if (!seenAuthors[tgName]) {
+          const m = SOCRATES_MASTER_MAP[tgName];
+          missing.push(m.name);
+          clarifications.push({ master: m.name, question: m.call + ', не вижу отчёта за сегодня — что было в работе?', object: null });
+        }
+      }
+    }
 
     const result = {
-      date: dateStr, reports: reports.length, parsed: records.length, written: written,
+      date: dateStr, is_weekend: isWeekend, reports: reports.length, parsed: records.length, written: written,
+      missing_reports: missing,
       records: records, clarifications: clarifications, updatedAt: new Date().toISOString()
     };
     cache[digestKey] = result; lastUpdate[digestKey] = Date.now();
