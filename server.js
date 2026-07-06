@@ -2586,6 +2586,9 @@ async function socratesClaudeParse(reports, deals) {
     '4. operation: закрепка/монтировка/литьё/полировка/эскиз/выборка фона/уборка и т.п. Если не указана — null.\n' +
     '5. business_unit: school (преподавание), brand (заказы, ножи, худож.), common (оргработа, отпуск).\n' +
     '6. day_fraction: по умолчанию 1.0 (один объект = весь день). Если в ОДИН день у одного мастера НЕСКОЛЬКО объектов — day_fraction=null и clarify=true (спросить распределение). Разные дни — каждый 1.0.\n' +
+    '6а. Проценты в отчёте — это доли дня: "70% замки, 30% приборка" = day_fraction 0.7 и 0.3. "Пол дня" = 0.5. Такие записи clarify=false — мастер уже распределил.\n' +
+    '6б. Короткое сообщение с одной операцией ("закрепка", "комплексно и обработка и закрепка...") — это ОТВЕТ на вчерашний вопрос об операции: отнеси его к последним дням работы этого мастера по его последнему ЗАКАЗУ (не к оргработе, не к дате сообщения).\n' +
+    '6в. Сообщение-исправление ("3.07 я не крепил, а прибирал класс") — это ПРАВКА конкретного дня: создай запись на указанную дату с правильной категорией/операцией.\n' +
     '7. confidence: high (объект и операция ясны), medium (объект ясен, операция нет), low (объект неоднозначен).\n' +
     '8. clarify=true если: операция не указана для deal/plakhov; объект неоднозначен; несколько объектов в день. clarify_question — короткий вопрос мастеру по-русски с обращением по имени.\n' +
     '9. Строки категории ignore не порождают записей work_log вообще.\n' +
@@ -2657,10 +2660,32 @@ async function computeSocratesDigest(dateStr) {
     for (const d of deals) if (d.num) dealByNum[d.num] = d.id;
 
     const records = parsed.records.filter(rec => rec.category !== 'ignore');
-    let written = 0;
+    // канонизация имён: как бы Claude ни назвал мастера (ERSHOV, Степан, Ершов) — в базу пишем одно имя
+    for (const rec of records) {
+      const cm = socratesMasterOf(rec.master);
+      if (cm) rec.master = cm.name;
+    }
+    let written = 0, merged = 0;
     for (const rec of records) {
       const dealId = rec.deal_num && dealByNum[rec.deal_num] ? dealByNum[rec.deal_num] : null;
       try {
+        // 1) сначала пробуем ЗАКРЫТЬ существующую незавершённую запись
+        // (тот же мастер+объект+день, где операция или доля ещё не определены) —
+        // так ответы мастеров на вопросы Сократа обновляют старые строки, а не плодят дубли
+        const upd = await pgPool.query(
+          `UPDATE work_log SET
+             operation = COALESCE($1, operation),
+             day_fraction = COALESCE($2, day_fraction),
+             confidence = $3, clarify = $4, clarify_question = $5
+           WHERE master = $6 AND COALESCE(object,'') = COALESCE($7,'') AND work_date = $8
+             AND (operation IS NULL OR day_fraction IS NULL)
+           RETURNING id`,
+          [rec.operation || null, rec.day_fraction === undefined ? null : rec.day_fraction,
+           rec.confidence || null, !!rec.clarify, rec.clarify_question || null,
+           rec.master || null, rec.object || null, rec.work_date || dateStr]
+        );
+        if (upd.rowCount > 0) { merged += upd.rowCount; continue; }
+        // 2) незакрытой записи нет — вставляем новую
         await pgPool.query(
           `INSERT INTO work_log(tg_report_id, work_date, master, category, object, deal_id, operation, business_unit, day_fraction, confidence, clarify, clarify_question, raw_text, digest_date, created_at)
            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
@@ -2708,7 +2733,8 @@ async function computeSocratesDigest(dateStr) {
     }
 
     const result = {
-      date: dateStr, is_weekend: isWeekend, reports: reports.length, parsed: records.length, written: written,
+      date: dateStr, is_weekend: isWeekend, reports: reports.length, parsed: records.length,
+      written: written, merged: merged,
       missing_reports: missing,
       records: records, clarifications: clarifications, updatedAt: new Date().toISOString()
     };
@@ -2826,15 +2852,162 @@ app.get('/socrates/month', async (req, res) => {
 });
 
 
+// онлайн-отчёт мастерской: /socrates/report?month=YYYY-MM (HTML, живые данные из work_log)
+const SOC_MONTHS = ['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
+function socEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function socWorkdays(month){ // будних дней в месяце YYYY-MM
+  const [y,m]=month.split('-').map(Number);
+  let n=0; const d=new Date(Date.UTC(y,m-1,1));
+  while(d.getUTCMonth()===m-1){ const w=d.getUTCDay(); if(w!==0&&w!==6)n++; d.setUTCDate(d.getUTCDate()+1); }
+  return n;
+}
+app.get('/socrates/report', async (req, res) => {
+  res.set('Content-Type','text/html; charset=utf-8');
+  if (!pgPool) return res.send('Postgres отключён');
+  const month = /^\d{4}-\d{2}$/.test(req.query.month||'') ? req.query.month : new Date(Date.now()+3*3600000).toISOString().slice(0,7);
+  const from = month+'-01', to = month+'-31';
+  try {
+    const r = await pgPool.query(
+      `SELECT master, category, object, operation, work_date, day_fraction, clarify, clarify_question
+       FROM work_log WHERE work_date >= $1 AND work_date <= $2 AND category <> 'ignore'
+       ORDER BY master, work_date`, [from, to]);
+    const rows = r.rows;
+    const CATS = {deal:'Производство', plakhov:'Авторские', teaching:'Курс', orgwork:'Орг', absence:'Отсутствие'};
+    const masters = {}; const objects = {}; const pending = [];
+    for (const x of rows) {
+      const m = x.master || '(неизвестный)';
+      if (!masters[m]) masters[m] = { days:{}, dates:new Set(), unresolved:0 };
+      const f = x.day_fraction===null ? 0 : Number(x.day_fraction);
+      masters[m].days[x.category] = (masters[m].days[x.category]||0) + f;
+      masters[m].dates.add(String(x.work_date).slice(0,10));
+      if (x.day_fraction===null) masters[m].unresolved++;
+      if (x.category==='deal'||x.category==='plakhov') {
+        const o = x.object || '(без объекта)';
+        if (!objects[o]) objects[o] = { days:0, who:{} , cat:x.category };
+        objects[o].days += f;
+        objects[o].who[m] = (objects[o].who[m]||0) + f;
+      }
+      if (x.clarify && x.clarify_question) pending.push({master:m, q:x.clarify_question, date:String(x.work_date).slice(0,10)});
+    }
+    const wd = socWorkdays(month);
+    const [yy,mm]=month.split('-').map(Number);
+    const prev = new Date(Date.UTC(yy,mm-2,1)).toISOString().slice(0,7);
+    const next = new Date(Date.UTC(yy,mm,1)).toISOString().slice(0,7);
+    const title = SOC_MONTHS[mm-1]+' '+yy;
+
+    const mRows = Object.keys(masters).sort((a,b)=>masters[b].dates.size-masters[a].dates.size).map(m=>{
+      const d=masters[m];
+      const cells=['deal','plakhov','teaching','orgwork','absence'].map(c=>{
+        const v=d.days[c]||0; return '<td class="n">'+(v?(Math.round(v*10)/10):'')+'</td>';
+      }).join('');
+      const unres = d.unresolved ? '<span class="warn">'+d.unresolved+' без долей</span>' : '';
+      return '<tr><td class="nm">'+socEsc(m)+'</td>'+cells+'<td class="n tot">'+d.dates.size+'</td><td class="mut">'+unres+'</td></tr>';
+    }).join('');
+
+    const maxObj = Math.max(1, ...Object.values(objects).map(o=>o.days));
+    const oRows = Object.keys(objects).sort((a,b)=>objects[b].days-objects[a].days).slice(0,20).map(o=>{
+      const x=objects[o]; const w=Math.round((x.days/maxObj)*100);
+      const who=Object.entries(x.who).map(([n,v])=>socEsc(n.split(' ')[0])+' '+(Math.round(v*10)/10)).join(', ');
+      return '<div class="orow"><div class="on">'+socEsc(o)+'</div><div class="ob"><div class="obar" style="width:'+w+'%"></div></div><div class="od">'+(Math.round(x.days*10)/10)+'</div><div class="ow">'+who+'</div></div>';
+    }).join('') || '<div class="mut">Нет производственных записей за месяц</div>';
+
+    const pRows = pending.slice(0,15).map(p=>'<div class="prow"><b>'+socEsc(p.master.split(' ')[0])+'</b> · '+p.date+' — '+socEsc(p.q)+'</div>').join('')
+      || '<div class="mut">Все записи месяца закрыты, уточнений не ждём</div>';
+
+    res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'+
+    '<title>Мастерская · '+socEsc(title)+'</title><style>'+
+    'body{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;background:#F7F5F0;color:#23262B;margin:0;line-height:1.5}'+
+    '.hero{background:#23262B;color:#F7F5F0;padding:34px 20px 28px}'+
+    '.wrap{max-width:860px;margin:0 auto;padding:0 20px}'+
+    'h1{font-family:Georgia,"Times New Roman",serif;font-size:26px;margin:0}'+
+    '.hero .sub{color:#A8853B;font-size:16px;margin-top:4px;font-family:Georgia,serif}'+
+    '.nav{margin-top:14px;font-size:13px}.nav a{color:#B9B4AA;text-decoration:none;margin-right:16px}.nav a:hover{color:#F7F5F0}'+
+    'h2{font-family:Georgia,serif;font-size:19px;margin:30px 0 12px}'+
+    'table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #E4E0D8}'+
+    'th,td{padding:9px 10px;font-size:13.5px;border-bottom:1px solid #EFECE5;text-align:left}'+
+    'th{color:#6E6A63;font-weight:600;font-size:11.5px}'+
+    'td.n{text-align:center}td.tot{color:#A8853B;font-weight:700}td.nm{font-weight:600}td.mut{color:#6E6A63;font-size:11.5px}'+
+    '.warn{color:#9a6700}'+
+    '.orow{display:flex;align-items:center;gap:10px;background:#fff;border:1px solid #E4E0D8;border-top:none;padding:7px 10px}'+
+    '.orow:first-of-type{border-top:1px solid #E4E0D8}'+
+    '.on{width:170px;font-weight:600;font-size:13.5px;flex-shrink:0}'+
+    '.ob{flex:1;background:#EFECE5;height:14px;max-width:240px}.obar{background:#A8853B;height:14px}'+
+    '.od{width:36px;color:#A8853B;font-weight:700;font-size:13.5px}'+
+    '.ow{color:#6E6A63;font-size:12px;flex:1}'+
+    '.prow{background:#fff;border:1px solid #E4E0D8;border-top:none;padding:8px 10px;font-size:13px}.prow:first-of-type{border-top:1px solid #E4E0D8}'+
+    '.mut{color:#6E6A63;font-size:13px}.foot{color:#8B867C;font-size:11.5px;margin:26px 0 40px}'+
+    '</style></head><body>'+
+    '<div class="hero"><div class="wrap"><h1>Мастерская KARAKURKCHI-PLAKHOV</h1><div class="sub">Итоги: '+socEsc(title)+'</div>'+
+    '<div class="nav"><a href="/socrates/report?month='+prev+'">&#8592; '+prev+'</a><a href="/socrates/report?month='+next+'">'+next+' &#8594;</a></div></div></div>'+
+    '<div class="wrap">'+
+    '<h2>Загрузка мастеров</h2>'+
+    '<table><tr><th>Мастер</th><th>Произв.</th><th>Авторские</th><th>Курс</th><th>Орг</th><th>Отсут.</th><th>Дней</th><th></th></tr>'+(mRows||'<tr><td colspan="8" class="mut">Нет данных за месяц</td></tr>')+'</table>'+
+    '<h2>Изделия месяца</h2>'+oRows+
+    '<h2>Открытые уточнения</h2>'+pRows+
+    '<div class="foot">Источник: ежедневные отчёты мастеров в Telegram, разбор Сократа. Рабочих дней в месяце: '+wd+'. Дни в таблице — сумма учтённых долей; «без долей» — записи, ждущие распределения от мастера.</div>'+
+    '</div></body></html>');
+  } catch (e) { res.send('Ошибка: '+socEsc(e.message)); }
+});
+
+
+
+// импорт исторических записей work_log (разовая загрузка истории WhatsApp)
+// POST /socrates/import?key=PHOTO_KEY  body: { records: [{work_date,master,category,object,operation,business_unit,day_fraction,confidence,raw_text}] }
+app.post('/socrates/import', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  if (!pgPool) return res.json({ error: 'postgres disabled' });
+  const recs = (req.body && req.body.records) || [];
+  if (!Array.isArray(recs) || !recs.length) return res.status(400).json({ error: 'body.records пуст' });
+  let written = 0, skipped = 0;
+  for (const rec of recs) {
+    if (!rec.work_date || !rec.master || !rec.category) { skipped++; continue; }
+    try {
+      await pgPool.query(
+        `INSERT INTO work_log(work_date, master, category, object, deal_id, operation, business_unit, day_fraction, confidence, clarify, clarify_question, raw_text, digest_date, created_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,false,null,$10,$11,$12)
+         ON CONFLICT(master, object, work_date, operation) DO NOTHING`,
+        [rec.work_date, rec.master, rec.category, rec.object || null, rec.deal_id || null,
+         rec.operation || null, rec.business_unit || null,
+         rec.day_fraction === undefined || rec.day_fraction === null ? 1.0 : rec.day_fraction,
+         rec.confidence || 'history', rec.raw_text || null, rec.work_date, Date.now()]
+      );
+      written++;
+    } catch (e) { skipped++; }
+  }
+  res.json({ received: recs.length, written: written, skipped: skipped });
+});
+
+// /socrates/reparse?from=2026-07-03&to=2026-07-06&key=PHOTO_KEY
+app.get('/socrates/reparse', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  if (!pgPool) return res.json({ error: 'postgres disabled' });
+  const from = req.query.from, to = req.query.to || req.query.from;
+  if (!from) return res.status(400).json({ error: 'нужны ?from=YYYY-MM-DD (&to=YYYY-MM-DD)' });
+  try {
+    const del = await pgPool.query('DELETE FROM work_log WHERE digest_date >= $1 AND digest_date <= $2', [from, to]);
+    const days = [];
+    let d = new Date(from + 'T12:00:00Z');
+    const end = new Date(to + 'T12:00:00Z');
+    while (d <= end) { days.push(d.toISOString().slice(0, 10)); d = new Date(d.getTime() + 86400000); }
+    const results = [];
+    for (const day of days) {
+      delete cache['socrates_digest_' + day];
+      const r = await computeSocratesDigest(day);
+      results.push({ date: day, reports: r.reports || 0, written: r.written || 0, merged: r.merged || 0, error: r.error || null });
+    }
+    res.json({ deleted: del.rowCount, days: results, note: 'work_log за диапазон пересобран последней логикой разбора' });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
 let socratesLastRun = null;
 if (process.env.SOCRATES_DIGEST === 'on') {
   setInterval(async function () {
     const utc = new Date();
     const h = utc.getUTCHours(), m = utc.getUTCMinutes();
     const todayMsk = new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 10);
-    if (h === 17 && m < 5 && socratesLastRun !== todayMsk) {
+    if (h === 19 && m < 5 && socratesLastRun !== todayMsk) {
       socratesLastRun = todayMsk;
-      console.log('🕗 Сократ: разбор дня', todayMsk);
+      console.log('🕙 Сократ: разбор дня', todayMsk);
       try {
         const digest = await computeSocratesDigest(todayMsk);
         if (!digest.error) {
@@ -2846,7 +3019,7 @@ if (process.env.SOCRATES_DIGEST === 'on') {
       } catch (e) { console.log('⚠️ Сократ scheduler:', e.message); }
     }
   }, 60 * 1000);
-  console.log('🕗 Сократ-планировщик ON (разбор в 20:00 МСК)');
+  console.log('🕗 Сократ-планировщик ON (разбор в 22:00 МСК)');
 }
 
 
