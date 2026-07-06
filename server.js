@@ -2732,6 +2732,23 @@ async function computeSocratesDigest(dateStr) {
       }
     }
 
+    // переспрос: незакрытые вопросы прошлых дней (до 5 дней назад) повторяем, пока мастер не ответит
+    try {
+      const since = new Date(new Date(dateStr + 'T12:00:00Z').getTime() - 5 * 86400000).toISOString().slice(0, 10);
+      const open = await pgPool.query(
+        `SELECT DISTINCT master, clarify_question FROM work_log
+         WHERE clarify = true AND clarify_question IS NOT NULL
+           AND work_date >= $1 AND work_date < $2 LIMIT 8`, [since, dateStr]);
+      const already = {};
+      for (const c of clarifications) already[(c.master||'') + '|' + c.question] = true;
+      for (const row of open.rows) {
+        const key = (row.master||'') + '|' + row.clarify_question;
+        if (already[key]) continue;
+        already[key] = true;
+        clarifications.push({ master: row.master, question: 'Напоминаю: ' + row.clarify_question, object: null });
+      }
+    } catch (e) { console.log('⚠️ переспрос:', e.message); }
+
     const result = {
       date: dateStr, is_weekend: isWeekend, reports: reports.length, parsed: records.length,
       written: written, merged: merged,
