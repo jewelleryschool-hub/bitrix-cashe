@@ -2814,7 +2814,8 @@ app.get('/socrates/month', async (req, res) => {
   if (!pgPool) return res.json({ error: 'postgres disabled' });
   const month = req.query.month || new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 7);
   const from = month + '-01';
-  const to = month + '-31';
+  const [__y, __m] = month.split('-').map(Number);
+  const to = new Date(Date.UTC(__y, __m, 0)).toISOString().slice(0, 10); // последний день месяца
   const masterFilter = req.query.master ? ' AND master ILIKE $3' : '';
   const params = req.query.master ? [from, to, '%' + req.query.master + '%'] : [from, to];
   try {
@@ -2865,7 +2866,8 @@ app.get('/socrates/report', async (req, res) => {
   res.set('Content-Type','text/html; charset=utf-8');
   if (!pgPool) return res.send('Postgres отключён');
   const month = /^\d{4}-\d{2}$/.test(req.query.month||'') ? req.query.month : new Date(Date.now()+3*3600000).toISOString().slice(0,7);
-  const from = month+'-01', to = month+'-31';
+  const [__ry, __rm] = month.split('-').map(Number);
+  const from = month+'-01', to = new Date(Date.UTC(__ry, __rm, 0)).toISOString().slice(0,10);
   try {
     const r = await pgPool.query(
       `SELECT master, category, object, operation, work_date, day_fraction, clarify, clarify_question
