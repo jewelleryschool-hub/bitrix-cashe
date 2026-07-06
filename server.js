@@ -2970,6 +2970,78 @@ app.get('/socrates/report', async (req, res) => {
 
 
 
+
+// онлайн-расчёт ЗП: /socrates/salary?month=YYYY-MM&key=PHOTO_KEY (&wd=21 — рабочих дней вручную)
+// ставки: env SOCRATES_SALARY = {"Имя":[оклад,надбавка],...} либо значения по умолчанию ниже
+const SOC_SALARY_DEFAULT = {
+  'Володя Плахов': [200000, 0],
+  'Игорь Деменцов': [80000, 0],
+  'Витя Комисар': [90000, 0],
+  'Кристина Спасская': [160000, 0],
+  'Степан Ершов': [180000, 40000],
+  'Олег Гиниборг': [120000, 0]
+};
+const SOC_TEACH_K = 1.45;
+app.get('/socrates/salary', async (req, res) => {
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).send('Доступ по ключу: ?key=...');
+  if (!pgPool) return res.send('Postgres отключён');
+  const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 7);
+  const [sy, sm] = month.split('-').map(Number);
+  const from = month + '-01';
+  const to = new Date(Date.UTC(sy, sm, 0)).toISOString().slice(0, 10);
+  let salary = SOC_SALARY_DEFAULT;
+  try { if (process.env.SOCRATES_SALARY) salary = JSON.parse(process.env.SOCRATES_SALARY); } catch (e) {}
+  const wd = parseInt(req.query.wd || '0', 10) || socWorkdays(month);
+  try {
+    const r = await pgPool.query(
+      `SELECT master, category, SUM(COALESCE(day_fraction,0)) AS days
+       FROM work_log WHERE work_date >= $1 AND work_date <= $2 AND category <> 'ignore'
+       GROUP BY master, category`, [from, to]);
+    const agg = {};
+    for (const x of r.rows) {
+      const m = x.master; if (!agg[m]) agg[m] = { total: 0, teach: 0, absent: 0 };
+      const v = Number(x.days || 0);
+      agg[m].total += v;
+      if (x.category === 'teaching') agg[m].teach += v;
+      if (x.category === 'absence') agg[m].absent += v;
+    }
+    const rnd = n => Math.round(n).toLocaleString('ru-RU');
+    let total = 0;
+    const rows = Object.keys(salary).map(m => {
+      const base = salary[m][0], bonus = salary[m][1] || 0;
+      const a = agg[m] || { total: 0, teach: 0, absent: 0 };
+      const worked = Math.round((a.total - a.absent) * 100) / 100;
+      const teach = Math.round(a.teach * 100) / 100;
+      const credit = Math.round(((worked - teach) + teach * SOC_TEACH_K) * 100) / 100;
+      const pay = Math.round(base / wd * credit + (worked > 0 ? bonus : 0));
+      total += pay;
+      const bonusCell = bonus ? '+' + rnd(bonus) : '';
+      return '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + worked + (a.absent ? ' <span class="mut">(+' + a.absent + ' отсут.)</span>' : '') + '</td><td class="n">' + (teach || '') + '</td><td class="n">' + credit + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + rnd(pay) + '</td></tr>';
+    }).join('');
+    const title = SOC_MONTHS[sm - 1] + ' ' + sy;
+    res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+      '<title>Расчёт ЗП · ' + socEsc(title) + '</title><style>' +
+      'body{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;background:#F7F5F0;color:#23262B;margin:0;line-height:1.5}' +
+      '.hero{background:#23262B;color:#F7F5F0;padding:30px 20px 24px}.wrap{max-width:900px;margin:0 auto;padding:0 20px}' +
+      'h1{font-family:Georgia,serif;font-size:24px;margin:0}.hero .sub{color:#A8853B;font-size:15px;margin-top:4px;font-family:Georgia,serif}' +
+      'table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #E4E0D8;margin-top:24px}' +
+      'th,td{padding:10px;font-size:13.5px;border-bottom:1px solid #EFECE5;text-align:left}' +
+      'th{color:#6E6A63;font-weight:600;font-size:11.5px}td.n{text-align:right}td.nm{font-weight:600}' +
+      'td.pay{color:#A8853B;font-weight:700;font-size:14.5px}.mut{color:#6E6A63;font-size:11px;font-weight:400}' +
+      'tr.tot td{border-top:2px solid #23262B;font-weight:700;font-size:14.5px}' +
+      '.foot{color:#8B867C;font-size:11.5px;margin:22px 0 40px;line-height:1.6}' +
+      '</style></head><body>' +
+      '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + '</div></div></div>' +
+      '<div class="wrap">' +
+      '<table><tr><th>Мастер</th><th style="text-align:right">Оклад</th><th style="text-align:right">Отработано, дн</th><th style="text-align:right">из них курс</th><th style="text-align:right">Зачёт, дн</th><th style="text-align:right">Надбавка</th><th style="text-align:right">К выплате, руб</th></tr>' +
+      rows +
+      '<tr class="tot"><td>ИТОГО</td><td></td><td></td><td></td><td></td><td></td><td class="n">' + rnd(total) + '</td></tr></table>' +
+      '<div class="foot">Формула: оклад / ' + wd + ' раб. дн. x зачётные дни + надбавка. Зачётные дни = обычные дни + ' + SOC_TEACH_K + ' x дни преподавания. Дни отсутствия (отпуск, болезнь) в зачёт не входят. Источник дней — учёт Сократа (work_log) по ежедневным отчётам мастеров. Рабочих дней в месяце: будние по календарю; при расхождении с производственным календарём РФ укажите вручную: &amp;wd=21. Расчёт справочный, основание выплат определяет руководитель.</div>' +
+      '</div></body></html>');
+  } catch (e) { res.send('Ошибка: ' + socEsc(e.message)); }
+});
+
 // импорт исторических записей work_log (разовая загрузка истории WhatsApp)
 // POST /socrates/import?key=PHOTO_KEY  body: { records: [{work_date,master,category,object,operation,business_unit,day_fraction,confidence,raw_text}] }
 app.post('/socrates/import', async (req, res) => {
