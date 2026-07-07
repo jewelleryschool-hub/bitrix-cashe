@@ -3166,7 +3166,28 @@ app.get('/socrates/reparse', async (req, res) => {
       const r = await computeSocratesDigest(day);
       results.push({ date: day, reports: r.reports || 0, written: r.written || 0, merged: r.merged || 0, error: r.error || null });
     }
-    res.json({ deleted: del.rowCount, days: results, note: 'work_log за диапазон пересобран последней логикой разбора' });
+    // финальная зачистка после пересборки: массовый разбор обрабатывает дни по
+    // порядку, поэтому ответы, пришедшие позже вопроса, могли не слиться.
+    // 1) удаляем незакрытые строки без операции, если по мастер+объект+день есть закрытая
+    let cleaned = 0;
+    try {
+      const c1 = await pgPool.query(
+        `DELETE FROM work_log w
+         WHERE w.digest_date >= $1 AND w.digest_date <= $2
+           AND w.clarify = true AND w.operation IS NULL
+           AND EXISTS (SELECT 1 FROM work_log w2
+             WHERE w2.master = w.master AND COALESCE(w2.object,'') = COALESCE(w.object,'')
+               AND w2.work_date = w.work_date AND w2.clarify = false)`, [from, to]);
+      cleaned += c1.rowCount;
+      // 2) снимаем флаг clarify с оставшихся, если по мастер+день уже есть закрытая запись
+      const c2 = await pgPool.query(
+        `UPDATE work_log w SET clarify = false, clarify_question = NULL
+         WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true
+           AND EXISTS (SELECT 1 FROM work_log w2
+             WHERE w2.master = w.master AND w2.work_date = w.work_date AND w2.clarify = false)`, [from, to]);
+      cleaned += c2.rowCount;
+    } catch (e) { console.log('⚠️ зачистка reparse:', e.message); }
+    res.json({ deleted: del.rowCount, cleaned: cleaned, days: results, note: 'work_log за диапазон пересобран последней логикой разбора' });
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
