@@ -3007,6 +3007,7 @@ app.get('/socrates/report', async (req, res) => {
     '<table><tr><th>Мастер</th><th>Произв.</th><th>Авторские</th><th>Курс</th><th>Орг</th><th>Отсут.</th><th>Дней</th><th></th></tr>'+(mRows||'<tr><td colspan="8" class="mut">Нет данных за месяц</td></tr>')+'</table>'+
     '<h2>Изделия месяца</h2>'+oRows+
     '<h2>Открытые уточнения</h2>'+pRows+
+    '<h2>Преподавание (курс)</h2>'+(Object.keys(masters).filter(m=>(masters[m].days.teaching||0)>0).sort((a,b)=>(masters[b].days.teaching||0)-(masters[a].days.teaching||0)).map(m=>'<div class="orow"><div class="on">'+socEsc(m)+'</div><div class="od">'+(Math.round((masters[m].days.teaching||0)*10)/10)+' дн</div></div>').join('')||'<div class="mut">Дней преподавания за месяц нет</div>')+
     '<div class="foot">Источник: ежедневные отчёты мастеров в Telegram, разбор Сократа. Рабочих дней в месяце: '+wd+'. Дни в таблице — сумма учтённых долей; «без долей» — записи, ждущие распределения от мастера.</div>'+
     '</div></body></html>');
   } catch (e) { res.send('Ошибка: '+socEsc(e.message)); }
@@ -3055,13 +3056,17 @@ app.get('/socrates/salary', async (req, res) => {
     const rows = Object.keys(salary).map(m => {
       const base = salary[m][0], bonus = salary[m][1] || 0;
       const a = agg[m] || { total: 0, teach: 0, absent: 0 };
-      const worked = Math.round((a.total - a.absent) * 100) / 100;
-      const teach = Math.round(a.teach * 100) / 100;
-      const credit = Math.round(((worked - teach) + teach * SOC_TEACH_K) * 100) / 100;
-      const pay = Math.round(base / wd * credit + (worked > 0 ? bonus : 0));
+      const worked = Math.round((a.total - a.absent) * 100) / 100;   // все отработанные (без отсутствий)
+      const teach = Math.round(a.teach * 100) / 100;                 // из них дни курса
+      const prod = Math.round((worked - teach) * 100) / 100;          // производственные дни
+      const rate = base / wd;                                         // дневная ставка от оклада
+      const prodPay = Math.round(rate * prod);                        // оклад только за производство
+      const teachPay = Math.round(rate * SOC_TEACH_K * teach);        // курс отдельно, по ставке ×1.45
+      const pay = prodPay + teachPay + (worked > 0 ? bonus : 0);
       total += pay;
       const bonusCell = bonus ? '+' + rnd(bonus) : '';
-      return '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + worked + (a.absent ? ' <span class="mut">(+' + a.absent + ' отсут.)</span>' : '') + '</td><td class="n">' + (teach || '') + '</td><td class="n">' + credit + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + rnd(pay) + '</td></tr>';
+      const teachCell = teach ? teach + ' <span class="mut">(' + rnd(teachPay) + ')</span>' : '';
+      return '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + prod + '</td><td class="n">' + teachCell + '</td><td class="n">' + rnd(prodPay + teachPay) + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + rnd(pay) + '</td></tr>';
     }).join('');
     const title = SOC_MONTHS[sm - 1] + ' ' + sy;
     res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
@@ -3078,12 +3083,24 @@ app.get('/socrates/salary', async (req, res) => {
       '</style></head><body>' +
       '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + '</div></div></div>' +
       '<div class="wrap">' +
-      '<table><tr><th>Мастер</th><th style="text-align:right">Оклад</th><th style="text-align:right">Отработано, дн</th><th style="text-align:right">из них курс</th><th style="text-align:right">Зачёт, дн</th><th style="text-align:right">Надбавка</th><th style="text-align:right">К выплате, руб</th></tr>' +
+      '<table><tr><th>Мастер</th><th style="text-align:right">Оклад</th><th style="text-align:right">Произв. дн</th><th style="text-align:right">Курс дн (оплата)</th><th style="text-align:right">За дни, руб</th><th style="text-align:right">Надбавка</th><th style="text-align:right">К выплате, руб</th></tr>' +
       rows +
       '<tr class="tot"><td>ИТОГО</td><td></td><td></td><td></td><td></td><td></td><td class="n">' + rnd(total) + '</td></tr></table>' +
-      '<div class="foot">Формула: оклад / ' + wd + ' раб. дн. x зачётные дни + надбавка. Зачётные дни = обычные дни + ' + SOC_TEACH_K + ' x дни преподавания. Дни отсутствия (отпуск, болезнь) в зачёт не входят. Источник дней — учёт Сократа (work_log) по ежедневным отчётам мастеров. Рабочих дней в месяце: будние по календарю; при расхождении с производственным календарём РФ укажите вручную: &amp;wd=21. Расчёт справочный, основание выплат определяет руководитель.</div>' +
+      '<div class="foot">Формула: дневная ставка = оклад / ' + wd + ' раб. дн. Оплата за производственные дни = ставка x произв. дни. Курс оплачивается отдельно: ставка x ' + SOC_TEACH_K + ' x дни преподавания. Плюс надбавка. Дни отсутствия (отпуск, болезнь, нет отчёта) не оплачиваются. Источник дней — учёт Сократа (work_log) по ежедневным отчётам мастеров. Рабочих дней в месяце — производственный календарь РФ (укажите вручную: &amp;wd=21). Расчёт справочный и на период запуска ТЕСТОВЫЙ; основание выплат определяет руководитель.</div>' +
       '</div></body></html>');
   } catch (e) { res.send('Ошибка: ' + socEsc(e.message)); }
+});
+
+// слияние объектов в work_log: /socrates/merge-object?from=Стилет&to=Адъютант&key=PHOTO_KEY
+app.get('/socrates/merge-object', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  if (!pgPool) return res.json({ error: 'postgres disabled' });
+  const from = req.query.from, to = req.query.to;
+  if (!from || !to) return res.status(400).json({ error: 'нужны ?from=Объект&to=Объект' });
+  try {
+    const r = await pgPool.query('UPDATE work_log SET object=$1 WHERE object=$2', [to, from]);
+    res.json({ merged: r.rowCount, from: from, to: to, note: from + ' → ' + to });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
 // импорт исторических записей work_log (разовая загрузка истории WhatsApp)
