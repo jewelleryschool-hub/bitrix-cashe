@@ -3171,21 +3171,33 @@ app.get('/socrates/reparse', async (req, res) => {
     // 1) удаляем незакрытые строки без операции, если по мастер+объект+день есть закрытая
     let cleaned = 0;
     try {
+      // 1) удаляем незакрытые пустые строки, если по мастер+объект есть закрытая запись
+      // в окне ±4 дня (ответ мог прийти другим днём и одним сообщением за несколько дат)
       const c1 = await pgPool.query(
         `DELETE FROM work_log w
          WHERE w.digest_date >= $1 AND w.digest_date <= $2
-           AND w.clarify = true AND w.operation IS NULL
+           AND w.clarify = true AND w.operation IS NULL AND w.object IS NOT NULL
            AND EXISTS (SELECT 1 FROM work_log w2
-             WHERE w2.master = w.master AND COALESCE(w2.object,'') = COALESCE(w.object,'')
-               AND w2.work_date = w.work_date AND w2.clarify = false)`, [from, to]);
+             WHERE w2.master = w.master AND w2.object = w.object
+               AND w2.clarify = false AND w2.operation IS NOT NULL
+               AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
       cleaned += c1.rowCount;
-      // 2) снимаем флаг clarify с оставшихся, если по мастер+день уже есть закрытая запись
+      // 2) снимаем clarify с оставшихся, где по мастер+день есть закрытая запись
       const c2 = await pgPool.query(
         `UPDATE work_log w SET clarify = false, clarify_question = NULL
          WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true
            AND EXISTS (SELECT 1 FROM work_log w2
              WHERE w2.master = w.master AND w2.work_date = w.work_date AND w2.clarify = false)`, [from, to]);
       cleaned += c2.rowCount;
+      // 3) снимаем clarify по мастер+объект в окне ±4 дня (ответ другим днём)
+      const c3 = await pgPool.query(
+        `UPDATE work_log w SET clarify = false, clarify_question = NULL
+         WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true AND w.object IS NOT NULL
+           AND EXISTS (SELECT 1 FROM work_log w2
+             WHERE w2.master = w.master AND w2.object = w.object
+               AND w2.clarify = false AND w2.operation IS NOT NULL
+               AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
+      cleaned += c3.rowCount;
     } catch (e) { console.log('⚠️ зачистка reparse:', e.message); }
     res.json({ deleted: del.rowCount, cleaned: cleaned, days: results, note: 'work_log за диапазон пересобран последней логикой разбора' });
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
