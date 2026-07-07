@@ -2595,7 +2595,8 @@ async function socratesClaudeParse(reports, deals) {
     '6в. Сообщение-исправление или уточнение с ЯВНОЙ ДАТОЙ ("3.07 я не крепил, а прибирал", "2.07 замки, 3.07 приборка") относится к ЭТОЙ дате из текста, НЕ к дате сообщения. Даже если прислано через несколько дней — это правка того дня. work_date = дата из текста.\n' +
     '6г. Если мастер несколькими сообщениями за один день уточняет ОДИН и тот же рабочий день (сначала "215, скребу поры", потом "7 часов дома по 215") — это ОДНА работа, объедини в одну запись по заказу, не создавай две. Часы бери из более полного/позднего сообщения.\n' +
     '7. confidence: high (объект и операция ясны), medium (объект ясен, операция нет), low (объект неоднозначен).\n' +
-    '8. clarify=true если: операция не указана для deal/plakhov; объект неоднозначен; несколько объектов в день. clarify_question — короткий вопрос мастеру по-русски с обращением по имени.\n' +
+    '8. clarify=true если: операция не указана для deal/plakhov; объект неоднозначен; несколько объектов в день. clarify_question — вопрос мастеру по-русски с обращением по имени.\n' +
+    '8-ТОН. Сократ общается с мастерами как дружелюбный коллега, а не бюрократ. Тон тёплый, живой, на «ты», без канцелярита и сарказма. Уместная лёгкая шутка примерно в одном вопросе из трёх — но НЕ в каждом. ВОЗРАСТ важен для регистра: Витя — 60, к нему особенно уважительно, как к старшему мастеру; советское кино и добрый юмор с ним максимально к месту. Олег — 53, тоже уважительно, но можно чуть живее. К обоим без молодёжного панибратства; уместны лёгкие цитаты из советского кино («Бриллиантовая рука», «Кавказская пленница», «Операция Ы», «Иван Васильевич меняет профессию», «Джентльмены удачи»), если ложатся к месту — например "Витя, куй железо, не отходя от кассы: по 215 сегодня что было?" или "Олег, будь другом, расскажи, по 231 какой этап — а то я теряюсь в догадках". Не притягивай цитату силой, только когда естественно. Степан (~30) и Кристина (~35) — можно чуть свободнее и легче, современно. Игорь и Володя — нейтрально-дружески. Примеры хорошего тона: "Степан, а по 221 в среду-четверг что делал — закрепка, полировка? Подскажи, запишу точно". "Игорь, помоги разложить: 2 и 3 июля между Нуво и приборкой как поделить по времени?". Плохой тон: сухое "Не вижу отчёта. Предоставьте информацию".\n' +
     '9. Строки категории ignore не порождают записей work_log вообще.\n' +
     '10. Дедуп: если один мастер в один день по одному объекту — одна запись, даже если сырьё дублируется.\n' +
     '11. В clarify_question обращайся по ИМЕНИ из карты обращений (Степан, Олег...), не по фамилии и не по telegram-нику.\n' +
@@ -2770,7 +2771,14 @@ async function computeSocratesDigest(dateStr) {
         if (!seenMasters[name]) {
           const m = SOCRATES_MASTER_MAP[name];
           missing.push(name);
-          clarifications.push({ master: name, question: m.call + ', не вижу отчёта за сегодня — что было в работе?', object: null });
+          const nudges = [
+            m.call + ', не вижу от тебя сводки за день — всё в порядке? Черкни пару слов, что было в работе',
+            m.call + ', как прошёл день? Напиши, чем занимался, чтобы я записал точно',
+            m.call + ', жду от тебя весточку за сегодня, чтобы ничего не потерялось. Что делал?',
+            m.call + ', подскажи, как сегодня время распределилось — хочу записать твою работу верно'
+          ];
+          const nq = nudges[Math.floor(Math.random() * nudges.length)];
+          clarifications.push({ master: name, question: nq, object: null });
         }
       }
     }
@@ -2778,10 +2786,17 @@ async function computeSocratesDigest(dateStr) {
     // переспрос: незакрытые вопросы прошлых дней (до 5 дней назад) повторяем, пока мастер не ответит
     try {
       const since = new Date(new Date(dateStr + 'T12:00:00Z').getTime() - 5 * 86400000).toISOString().slice(0, 10);
+      // берём открытый вопрос ТОЛЬКО если по тому же мастеру и рабочему дню НЕТ ни одной
+      // закрытой (clarify=false) записи — то есть мастер на этот день ещё не ответил ничем.
+      // Это ловит ответы, пришедшие другим календарным днём.
       const open = await pgPool.query(
-        `SELECT DISTINCT master, clarify_question FROM work_log
-         WHERE clarify = true AND clarify_question IS NOT NULL
-           AND work_date >= $1 AND work_date < $2 LIMIT 8`, [since, dateStr]);
+        `SELECT DISTINCT w.master, w.clarify_question FROM work_log w
+         WHERE w.clarify = true AND w.clarify_question IS NOT NULL
+           AND w.work_date >= $1 AND w.work_date < $2
+           AND NOT EXISTS (
+             SELECT 1 FROM work_log w2
+             WHERE w2.master = w.master AND w2.work_date = w.work_date AND w2.clarify = false)
+         LIMIT 8`, [since, dateStr]);
       const already = {};
       for (const c of clarifications) already[(c.master||'') + '|' + c.question] = true;
       for (const row of open.rows) {
@@ -2937,6 +2952,10 @@ app.get('/socrates/report', async (req, res) => {
     const rows = r.rows;
     const CATS = {deal:'Производство', plakhov:'Авторские', teaching:'Курс', orgwork:'Орг', absence:'Отсутствие'};
     const masters = {}; const objects = {}; const pending = [];
+    const closedDays = {}; // мастер|день, где есть закрытая (отвеченная) запись
+    for (const x of rows) {
+      if (!x.clarify) closedDays[(x.master||'') + '|' + String(x.work_date).slice(0,10)] = true;
+    }
     for (const x of rows) {
       const m = x.master || '(неизвестный)';
       if (!masters[m]) masters[m] = { days:{}, dates:new Set(), unresolved:0 };
@@ -2950,7 +2969,7 @@ app.get('/socrates/report', async (req, res) => {
         objects[o].days += f;
         objects[o].who[m] = (objects[o].who[m]||0) + f;
       }
-      if (x.clarify && x.clarify_question) pending.push({master:m, q:x.clarify_question, date:String(x.work_date).slice(0,10)});
+      if (x.clarify && x.clarify_question && !closedDays[(x.master||'') + '|' + String(x.work_date).slice(0,10)]) pending.push({master:m, q:x.clarify_question, date:String(x.work_date).slice(0,10)});
     }
     const wd = socWorkdays(month);
     const [yy,mm]=month.split('-').map(Number);
