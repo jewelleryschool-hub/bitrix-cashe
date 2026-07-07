@@ -162,6 +162,8 @@ async function pgLoadAllIntoMemory(cache) {
     const result = await pgPool.query('SELECT key, value FROM cache');
     let loaded = 0;
     for (const row of result.rows) {
+      // digest-снапшоты не поднимаем: разбор всегда должен считаться заново
+      if (row.key && row.key.indexOf('socrates_digest_') === 0) continue;
       try {
         cache[row.key] = JSON.parse(row.value);
         loaded++;
@@ -2587,6 +2589,8 @@ async function socratesClaudeParse(reports, deals) {
     '5. business_unit: school (преподавание), brand (заказы, ножи, худож.), common (оргработа, отпуск).\n' +
     '6. day_fraction: по умолчанию 1.0 (один объект = весь день). Если в ОДИН день у одного мастера НЕСКОЛЬКО объектов — day_fraction=null и clarify=true (спросить распределение). Разные дни — каждый 1.0.\n' +
     '6а. Проценты в отчёте — это доли дня: "70% замки, 30% приборка" = day_fraction 0.7 и 0.3. "Пол дня" = 0.5. Такие записи clarify=false — мастер уже распределил.\n' +
+    '6а-1. ЧАСЫ = доли дня: если мастер указал время на операции в часах ("4 часа сборка, 3 часа закрепка 221, 1 час фото"), СЧИТАЙ доли сам = часы операции / сумма всех часов за день. Пример: 4+3+1=8ч → day_fraction 0.5, 0.375, 0.125. Округляй до 0.05. Это ГОТОВЫЙ ответ — clarify=false, НЕ переспрашивай. Если мастер отдельно написал "распредели сам/сама" — тем более считай, не спрашивай.\n' +
+    '6а-2. Слова про дорогу, обед, "работал дома", "приезжал" — это контекст, а не отдельные объекты. Учитывай часы работы по заказам, бытовой контекст в day_fraction не превращай.\n' +
     '6б. Короткое сообщение с одной операцией ("закрепка", "комплексно и обработка и закрепка...") — это ОТВЕТ на вчерашний вопрос об операции: отнеси его к последним дням работы этого мастера по его последнему ЗАКАЗУ (не к оргработе, не к дате сообщения).\n' +
     '6в. Сообщение-исправление ("3.07 я не крепил, а прибирал класс") — это ПРАВКА конкретного дня: создай запись на указанную дату с правильной категорией/операцией.\n' +
     '7. confidence: high (объект и операция ясны), medium (объект ясен, операция нет), low (объект неоднозначен).\n' +
@@ -2647,13 +2651,33 @@ async function computeSocratesDigest(dateStr) {
       msg_date: new Date(x.msg_date * 1000).toISOString(),
       text: x.text || ''
     }));
+    // дедуп отредактированных сообщений: Telegram шлёт каждую правку как новое.
+    // если один автор в течение 20 мин прислал похожие отчёты (общее начало),
+    // оставляем только последний — это финальная версия
+    const normHead = t => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 18);
+    const byAuthorHead = {};
+    for (const rep of reports) {
+      const k = rep.author + '|' + normHead(rep.text);
+      if (!rep.text || rep.text.length < 8) continue;
+      if (!byAuthorHead[k]) byAuthorHead[k] = [];
+      byAuthorHead[k].push(rep);
+    }
+    const dropIds = {};
+    for (const k of Object.keys(byAuthorHead)) {
+      const grp = byAuthorHead[k];
+      if (grp.length < 2) continue;
+      grp.sort((a, b) => new Date(a.msg_date) - new Date(b.msg_date));
+      const last = grp[grp.length - 1];
+      for (const g of grp) if (g.id !== last.id) dropIds[g.id] = true;
+    }
+    const dedup = reports.filter(rep => !dropIds[rep.id]);
     if (!reports.length) {
       const empty = { date: dateStr, reports: 0, records: [], clarifications: [], note: 'нет сообщений за эту дату' };
       cache[digestKey] = empty; lastUpdate[digestKey] = Date.now();
       return empty;
     }
     const deals = await socratesLoadDeals();
-    const parsed = await socratesClaudeParse(reports, deals);
+    const parsed = await socratesClaudeParse(dedup, deals);
     if (parsed.error) { const e = { date: dateStr, error: parsed.error }; cache[digestKey] = e; lastUpdate[digestKey] = Date.now(); return e; }
 
     const dealByNum = {};
@@ -2792,8 +2816,9 @@ app.get('/socrates/digest', async (req, res) => {
   const mskNow = new Date(Date.now() + 3 * 3600000);
   const date = req.query.date || mskNow.toISOString().slice(0, 10);
   const digestKey = 'socrates_digest_' + date;
-  const wantRun = req.query.run === '1' || !cache[digestKey];
-  const result = wantRun ? await computeSocratesDigest(date) : cache[digestKey];
+  // digest всегда считается заново (аналитика — свежесть важнее скорости).
+  // ?cached=1 — отдать последний результат из памяти без пересчёта (быстрый просмотр)
+  const result = (req.query.cached === '1' && cache[digestKey]) ? cache[digestKey] : await computeSocratesDigest(date);
   if (req.query.ask === '1' && result && !result.error) {
     result.ask_result = await socratesSendQuestions(result, true);
   }
