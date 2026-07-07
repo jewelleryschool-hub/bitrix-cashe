@@ -2592,7 +2592,8 @@ async function socratesClaudeParse(reports, deals) {
     '6а-1. ЧАСЫ = доли дня: если мастер указал время на операции в часах ("4 часа сборка, 3 часа закрепка 221, 1 час фото"), СЧИТАЙ доли сам = часы операции / сумма всех часов за день. Пример: 4+3+1=8ч → day_fraction 0.5, 0.375, 0.125. Округляй до 0.05. Это ГОТОВЫЙ ответ — clarify=false, НЕ переспрашивай. Если мастер отдельно написал "распредели сам/сама" — тем более считай, не спрашивай.\n' +
     '6а-2. Слова про дорогу, обед, "работал дома", "приезжал" — это контекст, а не отдельные объекты. Учитывай часы работы по заказам, бытовой контекст в day_fraction не превращай.\n' +
     '6б. Короткое сообщение с одной операцией ("закрепка", "комплексно и обработка и закрепка...") — это ОТВЕТ на вчерашний вопрос об операции: отнеси его к последним дням работы этого мастера по его последнему ЗАКАЗУ (не к оргработе, не к дате сообщения).\n' +
-    '6в. Сообщение-исправление ("3.07 я не крепил, а прибирал класс") — это ПРАВКА конкретного дня: создай запись на указанную дату с правильной категорией/операцией.\n' +
+    '6в. Сообщение-исправление или уточнение с ЯВНОЙ ДАТОЙ ("3.07 я не крепил, а прибирал", "2.07 замки, 3.07 приборка") относится к ЭТОЙ дате из текста, НЕ к дате сообщения. Даже если прислано через несколько дней — это правка того дня. work_date = дата из текста.\n' +
+    '6г. Если мастер несколькими сообщениями за один день уточняет ОДИН и тот же рабочий день (сначала "215, скребу поры", потом "7 часов дома по 215") — это ОДНА работа, объедини в одну запись по заказу, не создавай две. Часы бери из более полного/позднего сообщения.\n' +
     '7. confidence: high (объект и операция ясны), medium (объект ясен, операция нет), low (объект неоднозначен).\n' +
     '8. clarify=true если: операция не указана для deal/plakhov; объект неоднозначен; несколько объектов в день. clarify_question — короткий вопрос мастеру по-русски с обращением по имени.\n' +
     '9. Строки категории ignore не порождают записей work_log вообще.\n' +
@@ -2709,6 +2710,24 @@ async function computeSocratesDigest(dateStr) {
            rec.master || null, rec.object || null, rec.work_date || dateStr]
         );
         if (upd.rowCount > 0) { merged += upd.rowCount; continue; }
+        // 1б) уточнение уже отчитанного дня: есть запись того же мастер+объект+день+категория
+        // с иной формулировкой операции — обновляем её (берём более свежие операцию/долю),
+        // а не плодим дубль. Защищает от повторной привязки исправлений за прошлые дни.
+        if (rec.object) {
+          const same = await pgPool.query(
+            `SELECT id FROM work_log
+             WHERE master=$1 AND COALESCE(object,'')=COALESCE($2,'') AND work_date=$3 AND category=$4
+             ORDER BY created_at ASC LIMIT 1`,
+            [rec.master || null, rec.object || null, rec.work_date || dateStr, rec.category || null]);
+          if (same.rowCount > 0) {
+            await pgPool.query(
+              `UPDATE work_log SET operation=COALESCE($1,operation),
+                 day_fraction=$2, confidence=$3, clarify=$4, clarify_question=$5 WHERE id=$6`,
+              [rec.operation || null, rec.day_fraction === undefined ? 1.0 : rec.day_fraction,
+               rec.confidence || null, !!rec.clarify, rec.clarify_question || null, same.rows[0].id]);
+            merged++; continue;
+          }
+        }
         // 2) незакрытой записи нет — вставляем новую
         await pgPool.query(
           `INSERT INTO work_log(tg_report_id, work_date, master, category, object, deal_id, operation, business_unit, day_fraction, confidence, clarify, clarify_question, raw_text, digest_date, created_at)
