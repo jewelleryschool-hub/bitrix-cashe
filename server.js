@@ -2504,14 +2504,14 @@ app.get('/socrates/reports', async (req, res) => {
 // раскладывает в work_log, помечает clarify для непонятных.
 // ============================================
 const SOCRATES_MASTER_MAP = {
-  // каноничное имя -> { call: обращение, aliases: варианты написания в Telegram (ник/имя/фамилия, лат/кир) }
+  // каноничное имя -> { call: обращение, gender: род для окончаний, aliases: варианты написания }
   // это же — ростер мастеров, от которых ждём ежедневный отчёт (кроме выходных)
-  'Степан Ершов': { call: 'Степан', aliases: ['ershov', 'степан', 'ершов', 'stepan'] },
-  'Олег Гиниборг': { call: 'Олег', aliases: ['oleg', 'олег', 'гиниборг'] },
-  'Игорь Деменцов': { call: 'Игорь', aliases: ['игорь', 'деменцов', 'igor'] },
-  'Витя Комисар': { call: 'Витя', aliases: ['viktor', 'витя', 'виктор', 'комисар', 'komisar'] },
-  'Кристина Спасская': { call: 'Кристина', aliases: ['кристина', 'спасская', 'kristina'] },
-  'Володя Плахов': { call: 'Володя', aliases: ['володя', 'плахов', 'vladimir', 'volodya', 'plakhov'] }
+  'Степан Ершов': { call: 'Степан', gender: 'm', aliases: ['ershov', 'степан', 'ершов', 'stepan'] },
+  'Олег Гиниборг': { call: 'Олег', gender: 'm', aliases: ['oleg', 'олег', 'гиниборг'] },
+  'Игорь Деменцов': { call: 'Игорь', gender: 'm', aliases: ['игорь', 'деменцов', 'igor'] },
+  'Витя Комисар': { call: 'Витя', gender: 'm', aliases: ['viktor', 'витя', 'виктор', 'комисар', 'komisar'] },
+  'Кристина Спасская': { call: 'Кристина', gender: 'f', aliases: ['кристина', 'спасская', 'kristina'] },
+  'Володя Плахов': { call: 'Володя', gender: 'm', aliases: ['володя', 'плахов', 'vladimir', 'volodya', 'plakhov'] }
 };
 
 // устойчивое сопоставление telegram-автора с мастером (без регистра, по подстроке алиаса)
@@ -2565,7 +2565,7 @@ function socratesResolveDate(dayWord, msgDateStr) {
   return d.toISOString().slice(0, 10);
 }
 
-async function socratesClaudeParse(reports, deals) {
+async function socratesClaudeParse(reports, deals, recentCtx) {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) return { error: 'NO_KEY' };
   const dealCatalog = deals.filter(d => d.num).map(d => d.num + '|' + d.title).join('\n');
@@ -2595,10 +2595,15 @@ async function socratesClaudeParse(reports, deals) {
     '6а-3. ОРГВОПРОСЫ, не преподавание: "запись презентации курса", "звонки по курсу/по школе", "общение со студентами", "экскурсия для студентов", подготовка материалов для курса — это orgwork со стороной ШКОЛА (operation "оргработа школа"), НЕ teaching. teaching ставится ТОЛЬКО когда мастер реально ВЁЛ занятие/преподавал ("преподавание Подготовительного курса", "провёл занятие"). Оргработа МАСТЕРСКОЙ: уборка, битрикс, инструмент, выдача работ, встреча с клиентом, "отвёз родий/камни", логистика, закупки → orgwork с operation "оргработа мастерская". Указывай сторону в operation для раздельного учёта.\n' +
     '6а-4. НЕПОЛНЫЙ ДЕНЬ — это НОРМА, не повод переспрашивать. Если мастер указал часы и они не набирают 8 (например "2 часа встреча, 1 час экскурсия" = 3 часа), значит он столько и работал — посчитай доли из этих часов (2/8=0.25, 1/8=0.125), clarify=false, НЕ спрашивай "чем занимался остальной день". Мастер отчитался полностью — остаток дня он просто не работал. Переспрашивай про распределение ТОЛЬКО когда объектов несколько, а часы по ним НЕ указаны.\n' +
     '6б. Короткое сообщение с одной операцией ("закрепка", "комплексно и обработка и закрепка...") — это ОТВЕТ на вчерашний вопрос об операции: отнеси его к последним дням работы этого мастера по его последнему ЗАКАЗУ. ОБЯЗАТЕЛЬНО проставь object = номер того заказа (посмотри, по какому заказу у этого мастера в эти дни висел незакрытый вопрос — обычно это заказ из его недавних отчётов). НЕ оставляй object пустым и НЕ относи к оргработе.\n' +
+    '6б-1. ВАЖНО: ответ на вопрос НЕ создаёт новый рабочий день. Если мастер уточняет операцию по вчерашней работе, work_date = ДАТА ТОЙ работы (вчерашняя), а НЕ дата сообщения. И НЕ ставь ему за сегодня ещё один полный день f=1 за то же самое — сумма долей мастера за один день не может превышать 1.0. Если сегодня он уже отчитался о другой работе, ответ про вчера идёт отдельной записью на вчерашнюю дату.\n' +
     '6в. Сообщение-исправление или уточнение с ЯВНОЙ ДАТОЙ ("3.07 я не крепил, а прибирал", "2.07 замки, 3.07 приборка") относится к ЭТОЙ дате из текста, НЕ к дате сообщения. Даже если прислано через несколько дней — это правка того дня. work_date = дата из текста.\n' +
     '6г. Если мастер несколькими сообщениями за один день уточняет ОДИН и тот же рабочий день (сначала "215, скребу поры", потом "7 часов дома по 215") — это ОДНА работа, объедини в одну запись по заказу, не создавай две. Часы бери из более полного/позднего сообщения.\n' +
+    '6г-1. СОСЕДНИЕ СООБЩЕНИЯ = ОДИН ОТЧЁТ. Некоторые мастера (особенно Витя) шлют отчёт двумя-тремя сообщениями подряд в течение нескольких минут: сначала номера заказов ("209, 214, 233, 231, 174."), следом операцию и часы ("6 часов заваривал полировал отгрузил на склад"). Склеивай такие сообщения одного автора, идущие подряд с разницей до ~10 минут, в ОДИН отчёт: номера из одного + операция/часы из другого. Не разбирай их изолированно и НЕ спрашивай номер, если он есть в соседнем сообщении.\n' +
+    '6г-2. "ПРОДОЛЖЕНИЕ" = та же операция, что мастер делал по этому заказу в предыдущий рабочий день. Пример: пн "разделка #220", вт "разделка #220", ср "продолжение #220" → в среду тоже разделка, операция ясна из контекста, clarify=false. Смотри предыдущие дни этого мастера по этому заказу и подставляй операцию сам, не переспрашивай.\n' +
+    '6г-3. Мастер может уточнить свой вчерашний отчёт на следующее утро ("8 часов титан первый" вчера → сегодня "Титан кольцо номер 142"). Это ОТВЕТ на вопрос, а не новая работа: проставь номер заказа во вчерашнюю запись, нового дня не создавай.\n' +
     '7. confidence: high (объект и операция ясны), medium (объект ясен, операция нет), low (объект неоднозначен).\n' +
     '8. clarify=true если: операция не указана для deal/plakhov; объект неоднозначен; несколько объектов в день. clarify_question — вопрос мастеру по-русски с обращением по имени.\n' +
+    '8-РОД. Кристина Спасская — ЖЕНЩИНА, обращайся в женском роде: "что делала", "чем занималась", "подскажи, как распределила день". Остальные пятеро (Степан, Олег, Игорь, Витя, Володя) — мужчины. Не путай окончания, это режет слух.\n' +
     '8-ТОН. Сократ общается с мастерами как дружелюбный коллега, а не бюрократ. Тон тёплый, живой, на «ты», без канцелярита и сарказма. Уместная лёгкая шутка примерно в одном вопросе из трёх — но НЕ в каждом. ВОЗРАСТ важен для регистра: Витя — 60, к нему особенно уважительно, как к старшему мастеру; советское кино и добрый юмор с ним максимально к месту. Олег — 53, тоже уважительно, но можно чуть живее. К обоим без молодёжного панибратства; уместны лёгкие цитаты из советского кино («Бриллиантовая рука», «Кавказская пленница», «Операция Ы», «Иван Васильевич меняет профессию», «Джентльмены удачи»), если ложатся к месту — например "Витя, куй железо, не отходя от кассы: по 215 сегодня что было?" или "Олег, будь другом, расскажи, по 231 какой этап — а то я теряюсь в догадках". Не притягивай цитату силой, только когда естественно. Степан (~30) и Кристина (~35) — можно чуть свободнее и легче, современно. Игорь и Володя — нейтрально-дружески. Примеры хорошего тона: "Степан, а по 221 в среду-четверг что делал — закрепка, полировка? Подскажи, запишу точно". "Игорь, помоги разложить: 2 и 3 июля между Нуво и приборкой как поделить по времени?". Плохой тон: сухое "Не вижу отчёта. Предоставьте информацию".\n' +
     '9. Строки категории ignore не порождают записей work_log вообще.\n' +
     '9а. КРИТИЧНО: Роман Каракуркчи (Roman Karakurkchi) — ВЛАДЕЛЕЦ, НЕ мастер. Его сообщения это управление, пояснения, пересказ чужих отчётов «чтобы бот понял», напоминания — их ВСЕГДА ignore, НИКОГДА не создавай записей под именем Роман. Так же ignore любого автора, кого нет в ростере мастеров (Людмила Харламова и прочие). Отчёт считается только от самого мастера с его аккаунта.\n' +
@@ -2610,7 +2615,10 @@ async function socratesClaudeParse(reports, deals) {
     'Только JSON, без пояснений и markdown.';
 
   const model = process.env.ANALYSIS_MODEL || 'claude-opus-4-8';
-  const body = JSON.stringify({ model: model, max_tokens: 4000, system: system, messages: [{ role: 'user', content: 'Отчёты:\n' + msgList }] });
+  const ctxBlock = recentCtx && recentCtx.length
+    ? 'НЕДАВНИЕ РАБОТЫ МАСТЕРОВ (для контекста: "продолжение" = та же операция, что тут по этому заказу):\n' + recentCtx + '\n\n'
+    : '';
+  const body = JSON.stringify({ model: model, max_tokens: 4000, system: system, messages: [{ role: 'user', content: ctxBlock + 'Отчёты:\n' + msgList }] });
   // до 3 попыток: Opus на большом контексте иногда отдаёт "Premature close" — повторяем
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -2645,9 +2653,12 @@ async function computeSocratesDigest(dateStr) {
   const digestKey = 'socrates_digest_' + dateStr;
   if (!pgPool) return { error: 'postgres disabled' };
   try {
-    // сырьё за дату (по дате сообщения; многодневные отчёты раскидает разбор)
-    const from = Math.floor(new Date(dateStr + 'T00:00:00+03:00').getTime() / 1000);
-    const to = Math.floor(new Date(dateStr + 'T23:59:59+03:00').getTime() / 1000);
+    // Скользящее окно: с 22:00 МСК предыдущего дня до 22:00 МСК текущего.
+    // Разбор идёт в 22:00, а ~29% мастеров пишут отчёт позже (22:03, 23:47, 00:05) —
+    // при календарном окне они терялись и попадали в «молчуны». Теперь их отчёт
+    // подхватывается следующим разбором, а реальная дата работы берётся из текста (правило 6в).
+    const from = Math.floor(new Date(dateStr + 'T22:00:00+03:00').getTime() / 1000) - 86400;
+    const to = Math.floor(new Date(dateStr + 'T22:00:00+03:00').getTime() / 1000);
     const r = await pgPool.query(
       'SELECT id, author_name AS author, text, msg_date FROM tg_reports WHERE msg_date >= $1 AND msg_date <= $2 ORDER BY id ASC',
       [from, to]
@@ -2686,7 +2697,20 @@ async function computeSocratesDigest(dateStr) {
       return empty;
     }
     const deals = await socratesLoadDeals();
-    const parsed = await socratesClaudeParse(dedup, deals);
+    // контекст: что мастера делали в предыдущие 7 дней — нужен для «продолжение #220»
+    // (операция берётся из прошлого дня) и для привязки уточнений к заказу
+    let recentCtx = '';
+    try {
+      const since = new Date(new Date(dateStr + 'T12:00:00Z').getTime() - 7 * 86400000).toISOString().slice(0, 10);
+      const rc = await pgPool.query(
+        `SELECT work_date, master, category, object, operation FROM work_log
+         WHERE work_date >= $1 AND work_date < $2 AND category IN ('deal','plakhov')
+         ORDER BY work_date DESC LIMIT 40`, [since, dateStr]);
+      recentCtx = rc.rows.map(x =>
+        String(x.work_date).slice(0, 10) + ' ' + (x.master || '') + ': ' +
+        (x.object || '?') + ' — ' + (x.operation || 'операция не указана')).join('\n');
+    } catch (e) { console.log('⚠️ recentCtx:', e.message); }
+    const parsed = await socratesClaudeParse(dedup, deals, recentCtx);
     if (parsed.error) { const e = { date: dateStr, error: parsed.error }; cache[digestKey] = e; lastUpdate[digestKey] = Date.now(); return e; }
 
     const dealByNum = {};
@@ -2697,6 +2721,25 @@ async function computeSocratesDigest(dateStr) {
     for (const rec of records) {
       const cm = socratesMasterOf(rec.master);
       if (cm) rec.master = cm.name;
+    }
+    // валидация долей: сумма за один день у одного мастера не может превышать 1.0.
+    // Бывает, когда ответ на вчерашний вопрос Claude записывает как новую работу с f=1
+    // поверх реальной работы дня. Нормализуем пропорционально.
+    const dayFrac = {};
+    for (const rec of records) {
+      if (rec.day_fraction === null || rec.day_fraction === undefined) continue;
+      const k = (rec.master || '') + '|' + (rec.work_date || dateStr);
+      dayFrac[k] = (dayFrac[k] || 0) + Number(rec.day_fraction);
+    }
+    for (const k of Object.keys(dayFrac)) {
+      if (dayFrac[k] <= 1.01) continue;
+      const coef = 1 / dayFrac[k];
+      console.log('⚠️ Сократ: перебор долей ' + k + ' = ' + dayFrac[k].toFixed(2) + ', нормализую');
+      for (const rec of records) {
+        if (rec.day_fraction === null || rec.day_fraction === undefined) continue;
+        if ((rec.master || '') + '|' + (rec.work_date || dateStr) !== k) continue;
+        rec.day_fraction = Math.round(rec.day_fraction * coef * 100) / 100;
+      }
     }
     let written = 0, merged = 0;
     for (const rec of records) {
@@ -2778,10 +2821,11 @@ async function computeSocratesDigest(dateStr) {
         if (!seenMasters[name]) {
           const m = SOCRATES_MASTER_MAP[name];
           missing.push(name);
+          const she = (m.gender === 'f');
           const nudges = [
             m.call + ', не вижу от тебя сводки за день — всё в порядке? Черкни пару слов, что было в работе',
-            m.call + ', как прошёл день? Напиши, чем занимался, чтобы я записал точно',
-            m.call + ', жду от тебя весточку за сегодня, чтобы ничего не потерялось. Что делал?',
+            m.call + ', как прошёл день? Напиши, чем ' + (she ? 'занималась' : 'занимался') + ', чтобы я записал точно',
+            m.call + ', жду от тебя весточку за сегодня, чтобы ничего не потерялось. Что ' + (she ? 'делала' : 'делал') + '?',
             m.call + ', подскажи, как сегодня время распределилось — хочу записать твою работу верно'
           ];
           const nq = nudges[Math.floor(Math.random() * nudges.length)];
@@ -3118,6 +3162,33 @@ app.get('/socrates/salary', async (req, res) => {
 });
 
 // удаление всех записей мастера: /socrates/drop-master?master=Роман&key=PHOTO_KEY
+// отправка сообщения от имени Сократа в группу мастерской (объявления, анонсы)
+// GET  /socrates/say?text=Привет&key=PHOTO_KEY   (текст в query, для коротких)
+// POST /socrates/say?key=PHOTO_KEY  body: { text: "многострочный текст" }
+async function socratesSay(text) {
+  if (!TG_SOCRATES_TOKEN) return { ok: false, error: 'нет токена' };
+  if (!text || !String(text).trim()) return { ok: false, error: 'пустой текст' };
+  try {
+    const r = await fetch('https://api.telegram.org/bot' + TG_SOCRATES_TOKEN + '/sendMessage', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_SOCRATES_CHAT, text: String(text), parse_mode: 'HTML' }),
+      timeout: 15000
+    });
+    const j = await r.json();
+    return j && j.ok ? { ok: true, message_id: j.result && j.result.message_id } : { ok: false, error: j && j.description };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+app.get('/socrates/say', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  const r = await socratesSay(req.query.text);
+  res.json(r);
+});
+app.post('/socrates/say', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  const r = await socratesSay(req.body && req.body.text);
+  res.json(r);
+});
+
 app.get('/socrates/drop-master', async (req, res) => {
   if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
   if (!pgPool) return res.json({ error: 'postgres disabled' });
