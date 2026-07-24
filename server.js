@@ -3318,6 +3318,22 @@ app.get('/socrates/reparse', async (req, res) => {
                AND w2.clarify = false AND w2.operation IS NOT NULL
                AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
       cleaned += c4.rowCount;
+      // 5) СХЛОПЫВАНИЕ дублей: если по мастер+объект+день несколько deal/plakhov записей
+      // с РАЗНОЙ формулировкой операции (напр. "закрепка" и "закрепка комплексно") —
+      // это одна работа. Оставляем запись с самой длинной операцией (самой полной),
+      // остальные за тот день удаляем. Так убирается двойной счёт человеко-дней.
+      const c5 = await pgPool.query(
+        `DELETE FROM work_log w
+         WHERE w.digest_date >= $1 AND w.digest_date <= $2
+           AND w.category IN ('deal','plakhov') AND w.object IS NOT NULL
+           AND EXISTS (
+             SELECT 1 FROM work_log w2
+             WHERE w2.master = w.master AND w2.object = w.object AND w2.work_date = w.work_date
+               AND w2.category = w.category AND w2.id <> w.id
+               AND (LENGTH(COALESCE(w2.operation,'')) > LENGTH(COALESCE(w.operation,''))
+                    OR (LENGTH(COALESCE(w2.operation,'')) = LENGTH(COALESCE(w.operation,'')) AND w2.id > w.id)))`,
+        [from, to]);
+      cleaned += c5.rowCount;
     } catch (e) { console.log('⚠️ зачистка reparse:', e.message); }
     res.json({ deleted: del.rowCount, cleaned: cleaned, days: results, note: 'work_log за диапазон пересобран последней логикой разбора' });
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
