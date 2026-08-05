@@ -3208,6 +3208,15 @@ app.post('/socrates/say', async (req, res) => {
   res.json(r);
 });
 
+// только зачистка без пересборки: /socrates/cleanup?from=2026-07-01&to=2026-07-31&key=PHOTO_KEY
+app.get('/socrates/cleanup', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  const from = req.query.from || '2026-07-01';
+  const to = req.query.to || '2026-07-31';
+  const cleaned = await socratesCleanupRange(from, to);
+  res.json({ cleaned: cleaned, from: from, to: to });
+});
+
 // построчная выдача work_log для аудита: /socrates/rows?from=2026-07-01&to=2026-07-31&key=PHOTO_KEY
 app.get('/socrates/rows', async (req, res) => {
   if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
@@ -3272,6 +3281,100 @@ app.post('/socrates/import', async (req, res) => {
   res.json({ received: recs.length, written: written, skipped: skipped });
 });
 
+async function socratesCleanupRange(from, to) {
+  let cleaned = 0;
+  if (!pgPool) return 0;
+  // финальная зачистка после пересборки: массовый разбор обрабатывает дни по
+  // порядку, поэтому ответы, пришедшие позже вопроса, могли не слиться.
+  // 1) удаляем незакрытые строки без операции, если по мастер+объект+день есть закрытая
+  try {
+    // 1) удаляем незакрытые пустые строки, если по мастер+объект есть закрытая запись
+    // в окне ±4 дня (ответ мог прийти другим днём и одним сообщением за несколько дат)
+    const c1 = await pgPool.query(
+    `DELETE FROM work_log w
+     WHERE w.digest_date >= $1 AND w.digest_date <= $2
+       AND w.clarify = true AND w.operation IS NULL AND w.object IS NOT NULL
+       AND EXISTS (SELECT 1 FROM work_log w2
+       WHERE w2.master = w.master AND w2.object = w.object
+         AND w2.clarify = false AND w2.operation IS NOT NULL
+         AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
+    cleaned += c1.rowCount;
+    // 2) снимаем clarify с оставшихся, где по мастер+день есть закрытая запись
+    const c2 = await pgPool.query(
+    `UPDATE work_log w SET clarify = false, clarify_question = NULL
+     WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true
+       AND EXISTS (SELECT 1 FROM work_log w2
+       WHERE w2.master = w.master AND w2.work_date = w.work_date AND w2.clarify = false)`, [from, to]);
+    cleaned += c2.rowCount;
+    // 3) снимаем clarify по мастер+объект в окне ±4 дня (ответ другим днём)
+    const c3 = await pgPool.query(
+    `UPDATE work_log w SET clarify = false, clarify_question = NULL
+     WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true AND w.object IS NOT NULL
+       AND EXISTS (SELECT 1 FROM work_log w2
+       WHERE w2.master = w.master AND w2.object = w.object
+         AND w2.clarify = false AND w2.operation IS NOT NULL
+         AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
+    cleaned += c3.rowCount;
+    // 4) страховка: гасим вопрос по заказу, если у мастера есть закрытая deal-запись
+    // в окне ±4 дня даже без проставленного объекта (ответ, потерявший номер)
+    const c4 = await pgPool.query(
+    `UPDATE work_log w SET clarify = false, clarify_question = NULL
+     WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true
+       AND w.category = 'deal'
+       AND EXISTS (SELECT 1 FROM work_log w2
+       WHERE w2.master = w.master AND w2.category = 'deal'
+         AND w2.clarify = false AND w2.operation IS NOT NULL
+         AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
+    cleaned += c4.rowCount;
+    // 5) СХЛОПЫВАНИЕ дублей: если по мастер+объект+день несколько deal/plakhov записей
+    // с РАЗНОЙ формулировкой операции (напр. "закрепка" и "закрепка комплексно") —
+    // это одна работа. Оставляем запись с самой длинной операцией (самой полной),
+    // остальные за тот день удаляем. Так убирается двойной счёт человеко-дней.
+    const c5 = await pgPool.query(
+    `DELETE FROM work_log w
+     WHERE w.digest_date >= $1 AND w.digest_date <= $2
+       AND w.category IN ('deal','plakhov') AND w.object IS NOT NULL
+       AND EXISTS (
+       SELECT 1 FROM work_log w2
+       WHERE w2.master = w.master AND w2.object = w.object AND w2.work_date = w.work_date
+         AND w2.category = w.category AND w2.id <> w.id
+         AND (LENGTH(COALESCE(w2.operation,'')) > LENGTH(COALESCE(w.operation,''))
+          OR (LENGTH(COALESCE(w2.operation,'')) = LENGTH(COALESCE(w.operation,'')) AND w2.id > w.id)))`,
+    [from, to]);
+    cleaned += c5.rowCount;
+    // 6) дубли orgwork/absence БЕЗ объекта по мастер+день: наслоения прогонов
+    // («уборка», «оргработа школа» по 3 раза за один день). Оставляем одну строку
+    // (с самой длинной операцией), остальные удаляем.
+    const c6 = await pgPool.query(
+    `DELETE FROM work_log w
+     WHERE w.digest_date >= $1 AND w.digest_date <= $2
+       AND w.category IN ('orgwork','absence') AND w.object IS NULL
+       AND EXISTS (
+       SELECT 1 FROM work_log w2
+       WHERE w2.master = w.master AND w2.work_date = w.work_date
+         AND w2.category = w.category AND w2.object IS NULL AND w2.id <> w.id
+         AND (LENGTH(COALESCE(w2.operation,'')) > LENGTH(COALESCE(w.operation,''))
+          OR (LENGTH(COALESCE(w2.operation,'')) = LENGTH(COALESCE(w.operation,'')) AND w2.id > w.id)))`,
+    [from, to]);
+    cleaned += c6.rowCount;
+    // 7) жёсткая нормализация: сумма долей мастера за день не может превышать 1.0.
+    // Переработки (>8ч) учитываются отдельным решением руководителя, базовый учёт — в днях.
+    const over = await pgPool.query(
+    `SELECT master, work_date, SUM(day_fraction) AS s FROM work_log
+     WHERE work_date >= $1 AND work_date <= $2 AND day_fraction IS NOT NULL
+     GROUP BY master, work_date HAVING SUM(day_fraction) > 1.001`, [from, to]);
+    for (const o of over.rows) {
+    const coef = 1.0 / Number(o.s);
+    await pgPool.query(
+      `UPDATE work_log SET day_fraction = ROUND((day_fraction * $1)::numeric, 3)
+       WHERE master = $2 AND work_date = $3 AND day_fraction IS NOT NULL`,
+      [coef, o.master, o.work_date]);
+    cleaned++;
+    }
+  } catch (e) { console.log('⚠️ зачистка reparse:', e.message); }
+  return cleaned;
+}
+
 // /socrates/reparse?from=2026-07-03&to=2026-07-06&key=PHOTO_KEY
 app.get('/socrates/reparse', async (req, res) => {
   if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
@@ -3290,66 +3393,7 @@ app.get('/socrates/reparse', async (req, res) => {
       const r = await computeSocratesDigest(day);
       results.push({ date: day, reports: r.reports || 0, written: r.written || 0, merged: r.merged || 0, error: r.error || null });
     }
-    // финальная зачистка после пересборки: массовый разбор обрабатывает дни по
-    // порядку, поэтому ответы, пришедшие позже вопроса, могли не слиться.
-    // 1) удаляем незакрытые строки без операции, если по мастер+объект+день есть закрытая
-    let cleaned = 0;
-    try {
-      // 1) удаляем незакрытые пустые строки, если по мастер+объект есть закрытая запись
-      // в окне ±4 дня (ответ мог прийти другим днём и одним сообщением за несколько дат)
-      const c1 = await pgPool.query(
-        `DELETE FROM work_log w
-         WHERE w.digest_date >= $1 AND w.digest_date <= $2
-           AND w.clarify = true AND w.operation IS NULL AND w.object IS NOT NULL
-           AND EXISTS (SELECT 1 FROM work_log w2
-             WHERE w2.master = w.master AND w2.object = w.object
-               AND w2.clarify = false AND w2.operation IS NOT NULL
-               AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
-      cleaned += c1.rowCount;
-      // 2) снимаем clarify с оставшихся, где по мастер+день есть закрытая запись
-      const c2 = await pgPool.query(
-        `UPDATE work_log w SET clarify = false, clarify_question = NULL
-         WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true
-           AND EXISTS (SELECT 1 FROM work_log w2
-             WHERE w2.master = w.master AND w2.work_date = w.work_date AND w2.clarify = false)`, [from, to]);
-      cleaned += c2.rowCount;
-      // 3) снимаем clarify по мастер+объект в окне ±4 дня (ответ другим днём)
-      const c3 = await pgPool.query(
-        `UPDATE work_log w SET clarify = false, clarify_question = NULL
-         WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true AND w.object IS NOT NULL
-           AND EXISTS (SELECT 1 FROM work_log w2
-             WHERE w2.master = w.master AND w2.object = w.object
-               AND w2.clarify = false AND w2.operation IS NOT NULL
-               AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
-      cleaned += c3.rowCount;
-      // 4) страховка: гасим вопрос по заказу, если у мастера есть закрытая deal-запись
-      // в окне ±4 дня даже без проставленного объекта (ответ, потерявший номер)
-      const c4 = await pgPool.query(
-        `UPDATE work_log w SET clarify = false, clarify_question = NULL
-         WHERE w.digest_date >= $1 AND w.digest_date <= $2 AND w.clarify = true
-           AND w.category = 'deal'
-           AND EXISTS (SELECT 1 FROM work_log w2
-             WHERE w2.master = w.master AND w2.category = 'deal'
-               AND w2.clarify = false AND w2.operation IS NOT NULL
-               AND ABS(w2.work_date - w.work_date) <= 4)`, [from, to]);
-      cleaned += c4.rowCount;
-      // 5) СХЛОПЫВАНИЕ дублей: если по мастер+объект+день несколько deal/plakhov записей
-      // с РАЗНОЙ формулировкой операции (напр. "закрепка" и "закрепка комплексно") —
-      // это одна работа. Оставляем запись с самой длинной операцией (самой полной),
-      // остальные за тот день удаляем. Так убирается двойной счёт человеко-дней.
-      const c5 = await pgPool.query(
-        `DELETE FROM work_log w
-         WHERE w.digest_date >= $1 AND w.digest_date <= $2
-           AND w.category IN ('deal','plakhov') AND w.object IS NOT NULL
-           AND EXISTS (
-             SELECT 1 FROM work_log w2
-             WHERE w2.master = w.master AND w2.object = w.object AND w2.work_date = w.work_date
-               AND w2.category = w.category AND w2.id <> w.id
-               AND (LENGTH(COALESCE(w2.operation,'')) > LENGTH(COALESCE(w.operation,''))
-                    OR (LENGTH(COALESCE(w2.operation,'')) = LENGTH(COALESCE(w.operation,'')) AND w2.id > w.id)))`,
-        [from, to]);
-      cleaned += c5.rowCount;
-    } catch (e) { console.log('⚠️ зачистка reparse:', e.message); }
+    const cleaned = await socratesCleanupRange(from, to);
     res.json({ deleted: del.rowCount, cleaned: cleaned, days: results, note: 'work_log за диапазон пересобран последней логикой разбора' });
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
