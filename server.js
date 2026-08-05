@@ -3208,6 +3208,21 @@ app.post('/socrates/say', async (req, res) => {
   res.json(r);
 });
 
+// построчная выдача work_log для аудита: /socrates/rows?from=2026-07-01&to=2026-07-31&key=PHOTO_KEY
+app.get('/socrates/rows', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  if (!pgPool) return res.json({ error: 'postgres disabled' });
+  const from = req.query.from || '2026-07-01';
+  const to = req.query.to || '2026-07-31';
+  try {
+    const r = await pgPool.query(
+      `SELECT id, work_date, master, category, object, operation, day_fraction, confidence, clarify, digest_date
+       FROM work_log WHERE work_date >= $1 AND work_date <= $2
+       ORDER BY master, work_date, id`, [from, to]);
+    res.json({ count: r.rowCount, rows: r.rows });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+
 app.get('/socrates/drop-master', async (req, res) => {
   if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
   if (!pgPool) return res.json({ error: 'postgres disabled' });
