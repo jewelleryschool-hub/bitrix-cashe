@@ -3021,7 +3021,8 @@ app.get('/socrates/report', async (req, res) => {
     }
     for (const x of rows) {
       const m = x.master || '(неизвестный)';
-      if (!masters[m]) masters[m] = { days:{}, dates:new Set(), unresolved:0 };
+      if (!masters[m]) masters[m] = { days:{}, dates:new Set(), unresolved:0, lines:[] };
+      masters[m].lines.push(x);
       const f = x.day_fraction===null ? 0 : Number(x.day_fraction);
       masters[m].days[x.category] = (masters[m].days[x.category]||0) + f;
       masters[m].dates.add(String(x.work_date).slice(0,10));
@@ -3040,20 +3041,40 @@ app.get('/socrates/report', async (req, res) => {
     const next = new Date(Date.UTC(yy,mm,1)).toISOString().slice(0,7);
     const title = SOC_MONTHS[mm-1]+' '+yy;
 
+    const CATRU = { deal:'Производство', plakhov:'Авторские', teaching:'Курс', orgwork:'Орг', absence:'Отсутствие' };
+    const d1 = v => Math.round(v*10)/10;
     const mRows = Object.keys(masters).sort((a,b)=>masters[b].dates.size-masters[a].dates.size).map(m=>{
       const d=masters[m];
       const cells=['deal','plakhov','teaching','orgwork','absence'].map(c=>{
-        const v=d.days[c]||0; return '<td class="n">'+(v?(Math.round(v*10)/10):'')+'</td>';
+        const v=d.days[c]||0; return '<span class="gc">'+(v?d1(v):'')+'</span>';
       }).join('');
       const unres = d.unresolved ? '<span class="warn">'+d.unresolved+' без долей</span>' : '';
-      return '<tr><td class="nm">'+socEsc(m)+'</td>'+cells+'<td class="n tot">'+d.dates.size+'</td><td class="mut">'+unres+'</td></tr>';
+      const byDate = {};
+      for (const x of d.lines) { const k=String(x.work_date).slice(0,10); (byDate[k]=byDate[k]||[]).push(x); }
+      const dateBlocks = Object.keys(byDate).sort().map(k=>{
+        const arr=byDate[k];
+        const sumF=arr.reduce((s,x)=>s+Number(x.day_fraction||0),0);
+        const dt=k.slice(5).split('-').reverse().join('.');
+        const wRows=arr.map(x=>{
+          const f=x.day_fraction===null?null:Number(x.day_fraction);
+          const fs=f===null?'<span class="warn">?</span>':(Math.round(f*1000)/1000);
+          const hs=f===null?'':(Math.round(f*8*10)/10)+' ч';
+          const cls=x.category==='absence'?' class="ab"':'';
+          return '<tr'+cls+'><td>'+(CATRU[x.category]||x.category)+'</td><td>'+socEsc(x.object||'—')+'</td><td class="op">'+socEsc((x.operation||'').slice(0,55))+'</td><td class="n">'+fs+'</td><td class="n">'+hs+'</td></tr>';
+        }).join('');
+        return '<details class="ddet"><summary><span>'+dt+'</span><span class="dh">'+(Math.round(sumF*1000)/1000)+' дн · '+(Math.round(sumF*8*10)/10)+' ч</span></summary>'+
+          '<table class="dt"><tr><th>Категория</th><th>Объект / сделка</th><th>Операция</th><th style="text-align:right">Доля</th><th style="text-align:right">Часы</th></tr>'+wRows+'</table></details>';
+      }).join('');
+      return '<details class="mdet"><summary><span class="gc nm">'+socEsc(m)+'</span>'+cells+
+        '<span class="gc tot">'+d.dates.size+'</span><span class="gc mut">'+unres+'</span></summary>'+
+        '<div class="dwrap">'+dateBlocks+'</div></details>';
     }).join('');
 
     const maxObj = Math.max(1, ...Object.values(objects).map(o=>o.days));
-    const oRows = Object.keys(objects).sort((a,b)=>objects[b].days-objects[a].days).slice(0,20).map(o=>{
+    const oRows = Object.keys(objects).sort((a,b)=>objects[b].days-objects[a].days).slice(0,25).map(o=>{
       const x=objects[o]; const w=Math.round((x.days/maxObj)*100);
-      const who=Object.entries(x.who).map(([n,v])=>socEsc(n.split(' ')[0])+' '+(Math.round(v*10)/10)).join(', ');
-      return '<div class="orow"><div class="on">'+socEsc(o)+'</div><div class="ob"><div class="obar" style="width:'+w+'%"></div></div><div class="od">'+(Math.round(x.days*10)/10)+'</div><div class="ow">'+who+'</div></div>';
+      const who=Object.entries(x.who).map(([n,v])=>socEsc(n.split(' ')[0])+' '+(Math.round(v*8*10)/10)+'ч').join(', ');
+      return '<div class="orow"><div class="on">'+socEsc(o)+'</div><div class="ob"><div class="obar" style="width:'+w+'%"></div></div><div class="od">'+(Math.round(x.days*8*10)/10)+' ч</div><div class="ow">'+who+'</div></div>';
     }).join('') || '<div class="mut">Нет производственных записей за месяц</div>';
 
     const pRows = pending.slice(0,15).map(p=>'<div class="prow"><b>'+socEsc(p.master.split(' ')[0])+'</b> · '+p.date+' — '+socEsc(p.q)+'</div>').join('')
@@ -3080,14 +3101,30 @@ app.get('/socrates/report', async (req, res) => {
     '.od{width:36px;color:#A8853B;font-weight:700;font-size:13.5px}'+
     '.ow{color:#6E6A63;font-size:12px;flex:1}'+
     '.prow{background:#fff;border:1px solid #E4E0D8;border-top:none;padding:8px 10px;font-size:13px}.prow:first-of-type{border-top:1px solid #E4E0D8}'+
+    '.ghead,.mdet summary{display:grid;grid-template-columns:1.6fr .7fr .8fr .6fr .6fr .6fr .55fr 1fr;align-items:center;gap:4px}'+
+    '.ghead{background:#F1EEE7;border:1px solid #E4E0D8;padding:8px 10px;font-size:11.5px;color:#6E6A63;font-weight:600}'+
+    '.mdet{background:#fff;border:1px solid #E4E0D8;border-top:none}'+
+    '.mdet summary{padding:9px 10px;cursor:pointer;list-style:none;font-size:13.5px}'+
+    '.mdet summary::-webkit-details-marker{display:none}'+
+    '.gc{text-align:center}.gc.nm{text-align:left;font-weight:600}.gc.nm::before{content:"▸ ";color:#A8853B}'+
+    '.mdet[open] .gc.nm::before{content:"▾ "}.gc.tot{color:#A8853B;font-weight:700}.gc.mut{font-size:11px;color:#6E6A63}'+
+    '.dt{width:100%;border:none;border-top:1px solid #EFECE5;margin:0}.dt th,.dt td{font-size:12px;padding:6px 10px}'+
+    '.dwrap{border-top:1px solid #EFECE5;padding:4px 8px 8px 22px;background:#FBFAF7}'+
+    '.ddet{border:1px solid #EFECE5;border-top:none;background:#fff}.ddet:first-of-type{border-top:1px solid #EFECE5}'+
+    '.ddet summary{display:flex;justify-content:space-between;padding:7px 10px;cursor:pointer;font-size:12.5px;list-style:none}'+
+    '.ddet summary::-webkit-details-marker{display:none}.ddet summary::before{content:"▸ ";color:#A8853B}'+
+    '.ddet[open] summary::before{content:"▾ "}.dh{color:#A8853B;font-weight:600}'+
+    '.dt .op{color:#6E6A63}.dt .ab td{color:#9a6700;background:#FDF9F0}'+
     '.mut{color:#6E6A63;font-size:13px}.foot{color:#8B867C;font-size:11.5px;margin:26px 0 40px}'+
     '</style></head><body>'+
     '<div class="hero"><div class="wrap"><h1>Мастерская KARAKURKCHI-PLAKHOV</h1><div class="sub">Итоги: '+socEsc(title)+'</div>'+
     '<div class="nav"><a href="/socrates/report?month='+prev+'">&#8592; '+prev+'</a><a href="/socrates/report?month='+next+'">'+next+' &#8594;</a></div></div></div>'+
     '<div class="wrap">'+
     '<h2>Загрузка мастеров</h2>'+
-    '<table><tr><th>Мастер</th><th>Произв.</th><th>Авторские</th><th>Курс</th><th>Орг</th><th>Отсут.</th><th>Дней</th><th></th></tr>'+(mRows||'<tr><td colspan="8" class="mut">Нет данных за месяц</td></tr>')+'</table>'+
-    '<h2>Изделия месяца</h2>'+oRows+
+    '<div class="ghead"><span class="gc nm">Мастер</span><span class="gc">Произв.</span><span class="gc">Авторские</span><span class="gc">Курс</span><span class="gc">Орг</span><span class="gc">Отсут.</span><span class="gc tot">Дней</span><span class="gc"></span></div>'+
+    (mRows||'<div class="mut">Нет данных за месяц</div>')+
+    '<div class="mut" style="margin-top:6px;font-size:11.5px">Нажмите на мастера, чтобы развернуть записи по дням.</div>'+
+    '<h2>Сделки и изделия: часы мастеров</h2>'+oRows+
     '<h2>Открытые уточнения</h2>'+pRows+
     '<h2>Преподавание (курс)</h2>'+(Object.keys(masters).filter(m=>(masters[m].days.teaching||0)>0).sort((a,b)=>(masters[b].days.teaching||0)-(masters[a].days.teaching||0)).map(m=>'<div class="orow"><div class="on">'+socEsc(m)+'</div><div class="od">'+(Math.round((masters[m].days.teaching||0)*10)/10)+' дн</div></div>').join('')||'<div class="mut">Дней преподавания за месяц нет</div>')+
     '<div class="foot">Источник: ежедневные отчёты мастеров в Telegram, разбор Сократа. Рабочих дней в месяце: '+wd+'. Дни в таблице — сумма учтённых долей; «без долей» — записи, ждущие распределения от мастера.</div>'+
@@ -3165,12 +3202,23 @@ app.get('/socrates/salary', async (req, res) => {
       const teachCell = teach ? d3(teach) + ' <span class="mut">(' + money(teachPay) + ')</span>' : '';
       rows += '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + d3(prod) + '</td><td class="n">' + teachCell + '</td><td class="n">' + money(prodPay + teachPay) + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + money(pay) + '</td></tr>';
       // блок детализации: формула цифрами + записи по дням
-      const lines = (detBy[m] || []).map(x => {
-        const dt = String(x.work_date).slice(5, 10).split('-').reverse().join('.');
-        const f = x.day_fraction === null ? '<span class="warn">?</span>' : d3(Number(x.day_fraction));
-        const cat = CATRU[x.category] || x.category;
-        const cls = x.category === 'absence' ? ' class="ab"' : '';
-        return '<tr' + cls + '><td>' + dt + '</td><td>' + cat + '</td><td>' + socEsc(x.object || '—') + '</td><td class="op">' + socEsc((x.operation || '').slice(0, 60)) + '</td><td class="n">' + f + '</td></tr>';
+      const byDate = {};
+      for (const x of (detBy[m] || [])) { const k = String(x.work_date).slice(0,10); (byDate[k]=byDate[k]||[]).push(x); }
+      const lines = Object.keys(byDate).sort().map(k => {
+        const arr = byDate[k];
+        const dt = k.slice(5).split('-').reverse().join('.');
+        let daySum = 0, dayPay = 0;
+        const wRows = arr.map(x => {
+          const f = x.day_fraction === null ? null : Number(x.day_fraction);
+          const paid = (f !== null && x.category !== 'absence') ? f * rate * (x.category === 'teaching' ? SOC_TEACH_K : 1) : 0;
+          if (f !== null && x.category !== 'absence') daySum += f;
+          dayPay += paid;
+          const fs = f === null ? '<span class="warn">?</span>' : d3(f);
+          const cls = x.category === 'absence' ? ' class="ab"' : '';
+          return '<tr' + cls + '><td>' + (CATRU[x.category]||x.category) + '</td><td>' + socEsc(x.object||'—') + '</td><td class="op">' + socEsc((x.operation||'').slice(0,55)) + '</td><td class="n">' + fs + '</td><td class="n">' + (f===null?'':(Math.round(f*8*10)/10)+' ч') + '</td><td class="n">' + (paid?money(paid):'') + '</td></tr>';
+        }).join('');
+        return '<details class="ddet"><summary><span>' + dt + '</span><span class="dh">' + d3(daySum) + ' дн · ' + (Math.round(daySum*8*10)/10) + ' ч · ' + money(dayPay) + ' ₽</span></summary>' +
+          '<table class="dt"><tr><th>Категория</th><th>Объект / сделка</th><th>Операция</th><th style="text-align:right">Доля</th><th style="text-align:right">Часы</th><th style="text-align:right">Начислено, ₽</th></tr>' + wRows + '</table></details>';
       }).join('');
       const formula =
         'Дневная ставка: ' + rnd(base) + ' / ' + wd + ' = <b>' + money(rate) + '</b> ₽/день<br>' +
@@ -3181,8 +3229,33 @@ app.get('/socrates/salary', async (req, res) => {
         '<br>ИТОГО: <b class="pay">' + money(pay) + '</b> ₽';
       detBlocks += '<details class="mdet"><summary><span class="sn">' + socEsc(m) + '</span><span class="sp">' + money(pay) + ' ₽</span></summary>' +
         '<div class="formula">' + formula + '</div>' +
-        '<table class="dt"><tr><th>Дата</th><th>Категория</th><th>Объект</th><th>Операция</th><th style="text-align:right">Доля дня</th></tr>' + lines + '</table></details>';
+        '<div class="dwrap">' + lines + '</div></details>';
     }
+    // себестоимость сделок по ЗП мастеров: Σ(доля × дневная ставка мастера)
+    const rateOf = {};
+    for (const mm of Object.keys(salary)) rateOf[mm] = salary[mm][0] / wd;
+    const cost = {};
+    for (const x of det.rows) {
+      if (x.category !== 'deal' && x.category !== 'plakhov') continue;
+      const f = x.day_fraction === null ? 0 : Number(x.day_fraction);
+      const rt = rateOf[x.master] || 0;
+      const o = x.object || '(без объекта)';
+      if (!cost[o]) cost[o] = { rub: 0, hours: 0, who: {} };
+      cost[o].rub += f * rt;
+      cost[o].hours += f * 8;
+      cost[o].who[x.master] = (cost[o].who[x.master] || 0) + f * rt;
+    }
+    let costTotal = 0;
+    const costRows = Object.keys(cost).sort((a,b)=>cost[b].rub-cost[a].rub).map(o=>{
+      const c = cost[o]; costTotal += c.rub;
+      const who = Object.entries(c.who).sort((a,b)=>b[1]-a[1]).map(([n,v])=>socEsc(n.split(' ')[0])+' '+money(v)).join(', ');
+      return '<tr><td class="nm">'+socEsc(o)+'</td><td class="n">'+(Math.round(c.hours*10)/10)+' ч</td><td class="n pay">'+money(c.rub)+'</td><td class="mut" style="font-size:11.5px">'+who+'</td></tr>';
+    }).join('');
+    const costBlock = '<h2 style="font-family:Georgia,serif;font-size:19px;margin:28px 0 10px">Себестоимость сделок (по ЗП мастеров)</h2>'+
+      '<table><tr><th>Сделка / изделие</th><th style="text-align:right">Часы</th><th style="text-align:right">Себестоимость, ₽</th><th>Разбивка по мастерам</th></tr>'+
+      costRows+
+      '<tr class="tot"><td>ИТОГО производство</td><td></td><td class="n">'+money(costTotal)+'</td><td></td></tr></table>'+
+      '<div class="mut" style="margin-top:6px;font-size:11.5px">Себестоимость = доли дней мастеров по сделке × их дневные ставки (оклад / '+wd+'). Курс и оргработа в себестоимость сделок не входят.</div>';
     const title = SOC_MONTHS[sm - 1] + ' ' + sy;
     res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
       '<title>Расчёт ЗП · ' + socEsc(title) + '</title><style>' +
@@ -3200,7 +3273,12 @@ app.get('/socrates/salary', async (req, res) => {
       '.mdet summary::-webkit-details-marker{display:none}.mdet summary::before{content:"▸ ";color:#A8853B}' +
       '.mdet[open] summary::before{content:"▾ "}.sn{font-weight:600}.sp{color:#A8853B;font-weight:700}' +
       '.formula{padding:10px 16px;background:#FBFAF7;border-top:1px solid #EFECE5;font-size:13px;line-height:1.8}' +
-      '.dt{margin:0;border:none}.dt th,.dt td{font-size:12px;padding:6px 10px}.dt .op{color:#6E6A63}' +
+      '.dt{margin:0;border:none;width:100%}.dt th,.dt td{font-size:12px;padding:6px 10px}.dt .op{color:#6E6A63}' +
+      '.dwrap{padding:4px 8px 8px 22px;background:#FBFAF7;border-top:1px solid #EFECE5}' +
+      '.ddet{border:1px solid #EFECE5;border-top:none;background:#fff}.ddet:first-of-type{border-top:1px solid #EFECE5}' +
+      '.ddet summary{display:flex;justify-content:space-between;padding:7px 10px;cursor:pointer;font-size:12.5px;list-style:none}' +
+      '.ddet summary::-webkit-details-marker{display:none}.ddet summary::before{content:"▸ ";color:#A8853B}' +
+      '.ddet[open] summary::before{content:"▾ "}.dh{color:#A8853B;font-weight:600}' +
       '.dt .ab td{color:#9a6700;background:#FDF9F0}.warn{color:#b00}' +
       '</style></head><body>' +
       '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + '</div></div></div>' +
@@ -3211,6 +3289,7 @@ app.get('/socrates/salary', async (req, res) => {
       '<h2 style="font-family:Georgia,serif;font-size:19px;margin:28px 0 10px">Детализация по мастерам</h2>' +
       '<div class="mut" style="margin-bottom:10px">Нажмите на имя, чтобы развернуть формулу расчёта и записи по дням из учёта Сократа.</div>' +
       detBlocks +
+      costBlock +
       '<div class="foot">Формула: дневная ставка = оклад / ' + wd + ' раб. дн. Оплата за производственные дни = ставка x произв. дни. Курс оплачивается отдельно: ставка x ' + SOC_TEACH_K + ' x дни преподавания. Плюс надбавка. Дни отсутствия (отпуск, болезнь, нет отчёта) не оплачиваются. Источник дней — учёт Сократа (work_log) по ежедневным отчётам мастеров. Рабочих дней в месяце — производственный календарь РФ (укажите вручную: &amp;wd=21). Расчёт справочный и на период запуска ТЕСТОВЫЙ; основание выплат определяет руководитель.</div>' +
       '</div></body></html>');
   } catch (e) { res.send('Ошибка: ' + socEsc(e.message)); }
