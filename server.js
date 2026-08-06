@@ -3125,6 +3125,16 @@ app.get('/socrates/salary', async (req, res) => {
       `SELECT master, category, SUM(COALESCE(day_fraction,0)) AS days
        FROM work_log WHERE work_date >= $1 AND work_date <= $2 AND category <> 'ignore'
        GROUP BY master, category`, [from, to]);
+    // детальные строки для раскрывающейся детализации по дням
+    const det = await pgPool.query(
+      `SELECT work_date, master, category, object, operation, day_fraction
+       FROM work_log WHERE work_date >= $1 AND work_date <= $2 AND category <> 'ignore'
+       ORDER BY master, work_date, id`, [from, to]);
+    const detBy = {};
+    for (const x of det.rows) {
+      if (!detBy[x.master]) detBy[x.master] = [];
+      detBy[x.master].push(x);
+    }
     const agg = {};
     for (const x of r.rows) {
       const m = x.master; if (!agg[m]) agg[m] = { total: 0, teach: 0, absent: 0 };
@@ -3134,22 +3144,45 @@ app.get('/socrates/salary', async (req, res) => {
       if (x.category === 'absence') agg[m].absent += v;
     }
     const rnd = n => Math.round(n).toLocaleString('ru-RU');
+    const CATRU = { deal: 'Производство', plakhov: 'Авторские', teaching: 'Курс', orgwork: 'Орг', absence: 'Отсутствие' };
+    const money = v => Number(v).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const d3 = v => Math.round(v * 1000) / 1000;
     let total = 0;
-    const rows = Object.keys(salary).map(m => {
+    let rows = '';
+    let detBlocks = '';
+    for (const m of Object.keys(salary)) {
       const base = salary[m][0], bonus = salary[m][1] || 0;
       const a = agg[m] || { total: 0, teach: 0, absent: 0 };
-      const worked = a.total - a.absent;   // все отработанные (без отсутствий), БЕЗ округлений
+      const worked = a.total - a.absent;
       const teach = a.teach;
-      const prod = worked - teach;          // производственные дни, точно
-      const rate = base / wd;                                         // дневная ставка от оклада
-      const prodPay = Math.round(rate * prod);                        // оклад только за производство
-      const teachPay = Math.round(rate * SOC_TEACH_K * teach);        // курс отдельно, по ставке ×1.45
+      const prod = worked - teach;
+      const rate = base / wd;
+      const prodPay = rate * prod;
+      const teachPay = rate * SOC_TEACH_K * teach;
       const pay = prodPay + teachPay + (worked > 0 ? bonus : 0);
       total += pay;
       const bonusCell = bonus ? '+' + rnd(bonus) : '';
-      const teachCell = teach ? teach + ' <span class="mut">(' + rnd(teachPay) + ')</span>' : '';
-      return '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + prod + '</td><td class="n">' + teachCell + '</td><td class="n">' + rnd(prodPay + teachPay) + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + rnd(pay) + '</td></tr>';
-    }).join('');
+      const teachCell = teach ? d3(teach) + ' <span class="mut">(' + money(teachPay) + ')</span>' : '';
+      rows += '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + d3(prod) + '</td><td class="n">' + teachCell + '</td><td class="n">' + money(prodPay + teachPay) + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + money(pay) + '</td></tr>';
+      // блок детализации: формула цифрами + записи по дням
+      const lines = (detBy[m] || []).map(x => {
+        const dt = String(x.work_date).slice(5, 10).split('-').reverse().join('.');
+        const f = x.day_fraction === null ? '<span class="warn">?</span>' : d3(Number(x.day_fraction));
+        const cat = CATRU[x.category] || x.category;
+        const cls = x.category === 'absence' ? ' class="ab"' : '';
+        return '<tr' + cls + '><td>' + dt + '</td><td>' + cat + '</td><td>' + socEsc(x.object || '—') + '</td><td class="op">' + socEsc((x.operation || '').slice(0, 60)) + '</td><td class="n">' + f + '</td></tr>';
+      }).join('');
+      const formula =
+        'Дневная ставка: ' + rnd(base) + ' / ' + wd + ' = <b>' + money(rate) + '</b> ₽/день<br>' +
+        'Производственные дни: ' + d3(prod) + ' × ' + money(rate) + ' = <b>' + money(prodPay) + '</b> ₽' +
+        (teach ? '<br>Дни курса: ' + d3(teach) + ' × ' + money(rate) + ' × ' + SOC_TEACH_K + ' = <b>' + money(teachPay) + '</b> ₽' : '') +
+        (a.absent ? '<br>Отсутствия (не оплачиваются): ' + d3(a.absent) + ' дн' : '') +
+        (bonus ? '<br>Надбавка: <b>' + rnd(bonus) + '</b> ₽' : '') +
+        '<br>ИТОГО: <b class="pay">' + money(pay) + '</b> ₽';
+      detBlocks += '<details class="mdet"><summary><span class="sn">' + socEsc(m) + '</span><span class="sp">' + money(pay) + ' ₽</span></summary>' +
+        '<div class="formula">' + formula + '</div>' +
+        '<table class="dt"><tr><th>Дата</th><th>Категория</th><th>Объект</th><th>Операция</th><th style="text-align:right">Доля дня</th></tr>' + lines + '</table></details>';
+    }
     const title = SOC_MONTHS[sm - 1] + ' ' + sy;
     res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
       '<title>Расчёт ЗП · ' + socEsc(title) + '</title><style>' +
@@ -3162,12 +3195,22 @@ app.get('/socrates/salary', async (req, res) => {
       'td.pay{color:#A8853B;font-weight:700;font-size:14.5px}.mut{color:#6E6A63;font-size:11px;font-weight:400}' +
       'tr.tot td{border-top:2px solid #23262B;font-weight:700;font-size:14.5px}' +
       '.foot{color:#8B867C;font-size:11.5px;margin:22px 0 40px;line-height:1.6}' +
+      '.mdet{background:#fff;border:1px solid #E4E0D8;border-top:none}.mdet:first-of-type{border-top:1px solid #E4E0D8}' +
+      '.mdet summary{padding:11px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;list-style:none}' +
+      '.mdet summary::-webkit-details-marker{display:none}.mdet summary::before{content:"▸ ";color:#A8853B}' +
+      '.mdet[open] summary::before{content:"▾ "}.sn{font-weight:600}.sp{color:#A8853B;font-weight:700}' +
+      '.formula{padding:10px 16px;background:#FBFAF7;border-top:1px solid #EFECE5;font-size:13px;line-height:1.8}' +
+      '.dt{margin:0;border:none}.dt th,.dt td{font-size:12px;padding:6px 10px}.dt .op{color:#6E6A63}' +
+      '.dt .ab td{color:#9a6700;background:#FDF9F0}.warn{color:#b00}' +
       '</style></head><body>' +
       '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + '</div></div></div>' +
       '<div class="wrap">' +
       '<table><tr><th>Мастер</th><th style="text-align:right">Оклад</th><th style="text-align:right">Произв. дн</th><th style="text-align:right">Курс дн (оплата)</th><th style="text-align:right">За дни, руб</th><th style="text-align:right">Надбавка</th><th style="text-align:right">К выплате, руб</th></tr>' +
       rows +
-      '<tr class="tot"><td>ИТОГО</td><td></td><td></td><td></td><td></td><td></td><td class="n">' + rnd(total) + '</td></tr></table>' +
+      '<tr class="tot"><td>ИТОГО</td><td></td><td></td><td></td><td></td><td></td><td class="n">' + money(total) + '</td></tr></table>' +
+      '<h2 style="font-family:Georgia,serif;font-size:19px;margin:28px 0 10px">Детализация по мастерам</h2>' +
+      '<div class="mut" style="margin-bottom:10px">Нажмите на имя, чтобы развернуть формулу расчёта и записи по дням из учёта Сократа.</div>' +
+      detBlocks +
       '<div class="foot">Формула: дневная ставка = оклад / ' + wd + ' раб. дн. Оплата за производственные дни = ставка x произв. дни. Курс оплачивается отдельно: ставка x ' + SOC_TEACH_K + ' x дни преподавания. Плюс надбавка. Дни отсутствия (отпуск, болезнь, нет отчёта) не оплачиваются. Источник дней — учёт Сократа (work_log) по ежедневным отчётам мастеров. Рабочих дней в месяце — производственный календарь РФ (укажите вручную: &amp;wd=21). Расчёт справочный и на период запуска ТЕСТОВЫЙ; основание выплат определяет руководитель.</div>' +
       '</div></body></html>');
   } catch (e) { res.send('Ошибка: ' + socEsc(e.message)); }
