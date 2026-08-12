@@ -2680,7 +2680,7 @@ async function socratesLiveTalk(call, gender, masterName, texts) {
         `SELECT work_date, category, object, operation, day_fraction FROM work_log
          WHERE master=$1 AND work_date >= (CURRENT_DATE - INTERVAL '10 days')
          ORDER BY work_date DESC LIMIT 25`, [masterName]);
-      ctx = rc.rows.map(x => String(x.work_date).slice(5,10)+' '+(x.category||'')+' '+(x.object||'')+' '+(x.operation||'')+' f='+x.day_fraction).join('\n');
+      ctx = rc.rows.map(x => socIsoDate(x.work_date).slice(5)+' '+(x.category||'')+' '+(x.object||'')+' '+(x.operation||'')+' f='+x.day_fraction).join('\n');
     } catch (e) {}
     const sys = 'Ты — Сократ, дружелюбный учётчик ювелирной мастерской KARAKURKCHI-PLAKHOV в Telegram-группе мастеров. ' +
       'Отвечай кратко (1-3 предложения), по-русски, тепло, на «ты», без канцелярита, можно с лёгкой шуткой. ' +
@@ -2722,7 +2722,7 @@ async function socratesLiveProcess(authorName) {
         `SELECT work_date, master, category, object, operation FROM work_log
          WHERE work_date >= $1 AND category IN ('deal','plakhov')
          ORDER BY work_date DESC LIMIT 40`, [since]);
-      recentCtx = rc.rows.map(x => String(x.work_date).slice(0, 10) + ' ' + (x.master || '') + ': ' + (x.object || '?') + ' — ' + (x.operation || '')).join('\n');
+      recentCtx = rc.rows.map(x => socIsoDate(x.work_date) + ' ' + (x.master || '') + ': ' + (x.object || '?') + ' — ' + (x.operation || '')).join('\n');
     } catch (e) {}
     const reports = batch.map((b, i) => ({ id: 'live' + i, author: authorName, msg_date: new Date(b.ts).toISOString(), text: b.text || '' }));
     const deals = await socratesLoadDeals();
@@ -2895,7 +2895,7 @@ async function computeSocratesDigest(dateStr) {
          WHERE work_date >= $1 AND work_date < $2 AND category IN ('deal','plakhov')
          ORDER BY work_date DESC LIMIT 40`, [since, dateStr]);
       recentCtx = rc.rows.map(x =>
-        String(x.work_date).slice(0, 10) + ' ' + (x.master || '') + ': ' +
+        socIsoDate(x.work_date) + ' ' + (x.master || '') + ': ' +
         (x.object || '?') + ' — ' + (x.operation || 'операция не указана')).join('\n');
     } catch (e) { console.log('⚠️ recentCtx:', e.message); }
     const parsed = await socratesClaudeParse(dedup, deals, recentCtx);
@@ -3095,6 +3095,10 @@ app.get('/socrates/month', async (req, res) => {
 
 // онлайн-отчёт мастерской: /socrates/report?month=YYYY-MM (HTML, живые данные из work_log)
 const SOC_MONTHS = ['январь','февраль','март','апрель','май','июнь','июль','август','сентябрь','октябрь','ноябрь','декабрь'];
+function socIsoDate(v) {
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  return String(v || '').slice(0, 10);
+}
 function socEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function socWorkdays(month){ // будних дней в месяце YYYY-MM
   const [y,m]=month.split('-').map(Number);
@@ -3118,7 +3122,7 @@ app.get('/socrates/report', async (req, res) => {
     const masters = {}; const objects = {}; const pending = [];
     const closedDays = {}; // мастер|день, где есть закрытая (отвеченная) запись
     for (const x of rows) {
-      if (!x.clarify) closedDays[(x.master||'') + '|' + String(x.work_date).slice(0,10)] = true;
+      if (!x.clarify) closedDays[(x.master||'') + '|' + socIsoDate(x.work_date)] = true;
     }
     for (const x of rows) {
       const m = x.master || '(неизвестный)';
@@ -3126,7 +3130,7 @@ app.get('/socrates/report', async (req, res) => {
       masters[m].lines.push(x);
       const f = x.day_fraction===null ? 0 : Number(x.day_fraction);
       masters[m].days[x.category] = (masters[m].days[x.category]||0) + f;
-      masters[m].dates.add(String(x.work_date).slice(0,10));
+      masters[m].dates.add(socIsoDate(x.work_date));
       if (x.day_fraction===null) masters[m].unresolved++;
       if (x.category==='deal'||x.category==='plakhov') {
         const o = x.object || '(без объекта)';
@@ -3134,7 +3138,7 @@ app.get('/socrates/report', async (req, res) => {
         objects[o].days += f;
         objects[o].who[m] = (objects[o].who[m]||0) + f;
       }
-      if (x.clarify && x.clarify_question && !closedDays[(x.master||'') + '|' + String(x.work_date).slice(0,10)]) pending.push({master:m, q:x.clarify_question, date:String(x.work_date).slice(0,10)});
+      if (x.clarify && x.clarify_question && !closedDays[(x.master||'') + '|' + socIsoDate(x.work_date)]) pending.push({master:m, q:x.clarify_question, date:socIsoDate(x.work_date)});
     }
     const wd = socWorkdays(month);
     const [yy,mm]=month.split('-').map(Number);
@@ -3151,7 +3155,7 @@ app.get('/socrates/report', async (req, res) => {
       }).join('');
       const unres = d.unresolved ? '<span class="warn">'+d.unresolved+' без долей</span>' : '';
       const byDate = {};
-      for (const x of d.lines) { const k=String(x.work_date).slice(0,10); (byDate[k]=byDate[k]||[]).push(x); }
+      for (const x of d.lines) { const k=socIsoDate(x.work_date); (byDate[k]=byDate[k]||[]).push(x); }
       const dateBlocks = Object.keys(byDate).sort().map(k=>{
         const arr=byDate[k];
         const sumF=arr.reduce((s,x)=>s+Number(x.day_fraction||0),0);
@@ -3304,7 +3308,7 @@ app.get('/socrates/salary', async (req, res) => {
       rows += '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + d3(prod) + '</td><td class="n">' + teachCell + '</td><td class="n">' + money(prodPay + teachPay) + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + money(pay) + '</td></tr>';
       // блок детализации: формула цифрами + записи по дням
       const lines = (detBy[m] || []).map(x => {
-        const dt = String(x.work_date).slice(5, 10).split('-').reverse().join('.');
+        const dt = socIsoDate(x.work_date).slice(5).split('-').reverse().join('.');
         const f = x.day_fraction === null ? null : Number(x.day_fraction);
         const isTeach = x.category === 'teaching';
         const isAbs = x.category === 'absence';
