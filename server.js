@@ -2469,6 +2469,16 @@ app.post('/socrates/tg', async (req, res) => {
         Date.now()
       ]
     );
+
+    // LIVE: копим пачку автора, окно тишины склеивает правки и серии сообщений
+    if ((process.env.SOCRATES_LIVE || '') === 'on' && socratesMasterOf(authorName)) {
+      (liveBatch[authorName] = liveBatch[authorName] || []).push({ text: text, ts: Date.now() });
+      if (liveTimers[authorName]) clearTimeout(liveTimers[authorName]);
+      liveTimers[authorName] = setTimeout(
+        () => socratesLiveProcess(authorName).catch(e => console.log('live:', e.message)),
+        LIVE_QUIET_MS
+      );
+    }
     console.log('✓ tg_reports +1:', authorName, '|', text.slice(0, 60));
   } catch (err) {
     console.log('⚠️ socrates/tg error:', err.message);
@@ -2651,6 +2661,164 @@ async function socratesClaudeParse(reports, deals, recentCtx) {
   return { error: lastErr || 'unknown' };
 }
 
+
+// ===== СОКРАТ-LIVE: собеседник в реальном времени (SOCRATES_LIVE=on) =====
+// Сообщение мастера -> окно тишины ~2 мин (склейка правок и пачек) -> разбор Claude ->
+// запись в work_log общей логикой -> сразу вопрос при неясности или короткая квитанция.
+// Прямое обращение («Сократ, ...») -> ответ-собеседник. Вечерний 22:00 остаётся дозачисткой.
+const liveTimers = {};
+const liveBatch = {};
+const LIVE_QUIET_MS = 115000;
+
+async function socratesLiveTalk(call, gender, masterName, texts) {
+  try {
+    const key = process.env.ANTHROPIC_API_KEY;
+    if (!key) return;
+    let ctx = '';
+    try {
+      const rc = await pgPool.query(
+        `SELECT work_date, category, object, operation, day_fraction FROM work_log
+         WHERE master=$1 AND work_date >= (CURRENT_DATE - INTERVAL '10 days')
+         ORDER BY work_date DESC LIMIT 25`, [masterName]);
+      ctx = rc.rows.map(x => String(x.work_date).slice(5,10)+' '+(x.category||'')+' '+(x.object||'')+' '+(x.operation||'')+' f='+x.day_fraction).join('\n');
+    } catch (e) {}
+    const sys = 'Ты — Сократ, дружелюбный учётчик ювелирной мастерской KARAKURKCHI-PLAKHOV в Telegram-группе мастеров. ' +
+      'Отвечай кратко (1-3 предложения), по-русски, тепло, на «ты», без канцелярита, можно с лёгкой шуткой. ' +
+      (gender === 'f' ? 'Собеседница — женщина, женский род. ' : '') +
+      'Обращайся: ' + call + '. Вопросы про учёт/дни — отвечай строго по данным ниже, не выдумывай. Нет данных — скажи честно.\n' +
+      'Записи мастера за 10 дней:\n' + (ctx || 'нет записей');
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: process.env.SOCRATES_MODEL || 'claude-sonnet-4-5-20250929', max_tokens: 300, system: sys,
+        messages: [{ role: 'user', content: texts.join('\n') }] }),
+      timeout: 30000
+    });
+    const j = await r.json();
+    const t = j && j.content && j.content[0] && j.content[0].text;
+    if (t) await socratesSay(t.slice(0, 900));
+  } catch (e) { console.log('live talk:', e.message); }
+}
+
+function liveCatRu(c) { return c === 'teaching' ? 'курс' : (c === 'orgwork' ? 'оргработа' : (c === 'absence' ? 'отсутствие' : 'работа')); }
+
+async function socratesLiveProcess(authorName) {
+  const batch = liveBatch[authorName] || [];
+  delete liveBatch[authorName]; 
+  delete liveTimers[authorName];
+  if (!batch.length || !pgPool) return;
+  const cm = socratesMasterOf(authorName);
+  if (!cm) return;
+  const masterName = Object.keys(SOCRATES_MASTER_MAP).find(k => SOCRATES_MASTER_MAP[k].call === cm.call) || authorName;
+  try {
+    const texts = batch.map(b => b.text).filter(Boolean);
+    if (!texts.length) return;
+    if (/сократ/i.test(texts.join(' '))) { await socratesLiveTalk(cm.call, cm.gender, masterName, texts); return; }
+    const dateStr = new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 10);
+    let recentCtx = '';
+    try {
+      const since = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
+      const rc = await pgPool.query(
+        `SELECT work_date, master, category, object, operation FROM work_log
+         WHERE work_date >= $1 AND category IN ('deal','plakhov')
+         ORDER BY work_date DESC LIMIT 40`, [since]);
+      recentCtx = rc.rows.map(x => String(x.work_date).slice(0, 10) + ' ' + (x.master || '') + ': ' + (x.object || '?') + ' — ' + (x.operation || '')).join('\n');
+    } catch (e) {}
+    const reports = batch.map((b, i) => ({ id: 'live' + i, author: authorName, msg_date: new Date(b.ts).toISOString(), text: b.text || '' }));
+    const deals = await socratesLoadDeals();
+    const parsed = await socratesClaudeParse(reports, deals, recentCtx);
+    if (parsed.error) { console.log('live parse:', parsed.error); return; }
+    const records = (parsed.records || []).filter(r => r.category !== 'ignore');
+    const wr = await socratesWriteRecords(records, dateStr);
+    const clar = (parsed.clarifications || []).slice(0, 2);
+    if (clar.length) {
+      await socratesSendQuestions({ clarifications: clar }, true);
+    } else if (wr.written + wr.merged > 0) {
+      const parts = records.filter(r => r.day_fraction !== null && r.day_fraction !== undefined).slice(0, 4)
+        .map(r => (r.object ? r.object + ' ' : '') + (r.operation || liveCatRu(r.category)) + ' ' + (Math.round(Number(r.day_fraction) * 8 * 10) / 10) + 'ч');
+      if (parts.length) {
+        const ok = ['Принял, ', 'Записал, ', 'Есть, ', 'Зафиксировал, '];
+        await socratesSay(ok[Math.floor(Math.random() * ok.length)] + cm.call + ': ' + parts.join(' · ') + ' ✍️');
+      }
+    }
+  } catch (e) { console.log('live process:', e.message); }
+}
+// ===== конец LIVE =====
+
+async function socratesWriteRecords(records, dateStr) {
+  // канонизация имён: как бы Claude ни назвал мастера (ERSHOV, Степан, Ершов) — в базу пишем одно имя
+  for (const rec of records) {
+    const cm = socratesMasterOf(rec.master);
+    if (cm) rec.master = cm.name;
+  }
+  // сумма долей >1.0 допустима как ПЕРЕРАБОТКА по часам (12ч=1.5) — не занижаем,
+  // только логируем для контроля.
+  const dayFrac = {};
+  for (const rec of records) {
+    if (rec.day_fraction === null || rec.day_fraction === undefined) continue;
+    const k = (rec.master || '') + '|' + (rec.work_date || dateStr);
+    dayFrac[k] = (dayFrac[k] || 0) + Number(rec.day_fraction);
+  }
+  for (const k of Object.keys(dayFrac)) {
+    if (dayFrac[k] > 1.01) console.log('ℹ️ Сократ: день ' + k + ' = ' + dayFrac[k].toFixed(2) + ' (переработка или дубль — контроль)');
+  }
+  let written = 0, merged = 0;
+  for (const rec of records) {
+    const dealId = rec.deal_num && dealByNum[rec.deal_num] ? dealByNum[rec.deal_num] : null;
+    try {
+      // 1) сначала пробуем ЗАКРЫТЬ существующую незавершённую запись
+      // (тот же мастер+объект+день, где операция или доля ещё не определены) —
+      // так ответы мастеров на вопросы Сократа обновляют старые строки, а не плодят дубли
+      const upd = await pgPool.query(
+        `UPDATE work_log SET
+           operation = COALESCE($1, operation),
+           day_fraction = COALESCE($2, day_fraction),
+           confidence = $3, clarify = $4, clarify_question = $5
+         WHERE master = $6 AND COALESCE(object,'') = COALESCE($7,'') AND work_date = $8
+           AND (operation IS NULL OR day_fraction IS NULL)
+         RETURNING id`,
+        [rec.operation || null, rec.day_fraction === undefined ? null : rec.day_fraction,
+         rec.confidence || null, !!rec.clarify, rec.clarify_question || null,
+         rec.master || null, rec.object || null, rec.work_date || dateStr]
+      );
+      if (upd.rowCount > 0) { merged += upd.rowCount; continue; }
+      // 1б) уточнение уже отчитанного дня: есть запись того же мастер+объект+день+категория
+      // с иной формулировкой операции — обновляем её (берём более свежие операцию/долю),
+      // а не плодим дубль. Защищает от повторной привязки исправлений за прошлые дни.
+      if (rec.object) {
+        const same = await pgPool.query(
+          `SELECT id FROM work_log
+           WHERE master=$1 AND COALESCE(object,'')=COALESCE($2,'') AND work_date=$3 AND category=$4
+           ORDER BY created_at ASC LIMIT 1`,
+          [rec.master || null, rec.object || null, rec.work_date || dateStr, rec.category || null]);
+        if (same.rowCount > 0) {
+          await pgPool.query(
+            `UPDATE work_log SET operation=COALESCE($1,operation),
+               day_fraction=$2, confidence=$3, clarify=$4, clarify_question=$5 WHERE id=$6`,
+            [rec.operation || null, rec.day_fraction === undefined ? 1.0 : rec.day_fraction,
+             rec.confidence || null, !!rec.clarify, rec.clarify_question || null, same.rows[0].id]);
+          merged++; continue;
+        }
+      }
+      // 2) незакрытой записи нет — вставляем новую
+      await pgPool.query(
+        `INSERT INTO work_log(tg_report_id, work_date, master, category, object, deal_id, operation, business_unit, day_fraction, confidence, clarify, clarify_question, raw_text, digest_date, created_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ON CONFLICT(master, object, work_date, operation) DO UPDATE SET
+           day_fraction=EXCLUDED.day_fraction, confidence=EXCLUDED.confidence,
+           clarify=EXCLUDED.clarify, clarify_question=EXCLUDED.clarify_question`,
+        [rec.tg_report_id || null, rec.work_date || dateStr, rec.master || null, rec.category || null,
+         rec.object || null, dealId, rec.operation || null, rec.business_unit || null,
+         rec.day_fraction === undefined ? 1.0 : rec.day_fraction, rec.confidence || null,
+         !!rec.clarify, rec.clarify_question || null, rec.raw_text || null, dateStr, Date.now()]
+      );
+      written++;
+    } catch (e) { console.log('⚠️ work_log insert:', e.message); }
+  }
+
+  return { written: written, merged: merged };
+}
+
 async function computeSocratesDigest(dateStr) {
   const digestKey = 'socrates_digest_' + dateStr;
   if (!pgPool) return { error: 'postgres disabled' };
@@ -2737,75 +2905,8 @@ async function computeSocratesDigest(dateStr) {
     for (const d of deals) if (d.num) dealByNum[d.num] = d.id;
 
     const records = parsed.records.filter(rec => rec.category !== 'ignore');
-    // канонизация имён: как бы Claude ни назвал мастера (ERSHOV, Степан, Ершов) — в базу пишем одно имя
-    for (const rec of records) {
-      const cm = socratesMasterOf(rec.master);
-      if (cm) rec.master = cm.name;
-    }
-    // сумма долей >1.0 допустима как ПЕРЕРАБОТКА по часам (12ч=1.5) — не занижаем,
-    // только логируем для контроля.
-    const dayFrac = {};
-    for (const rec of records) {
-      if (rec.day_fraction === null || rec.day_fraction === undefined) continue;
-      const k = (rec.master || '') + '|' + (rec.work_date || dateStr);
-      dayFrac[k] = (dayFrac[k] || 0) + Number(rec.day_fraction);
-    }
-    for (const k of Object.keys(dayFrac)) {
-      if (dayFrac[k] > 1.01) console.log('ℹ️ Сократ: день ' + k + ' = ' + dayFrac[k].toFixed(2) + ' (переработка или дубль — контроль)');
-    }
-    let written = 0, merged = 0;
-    for (const rec of records) {
-      const dealId = rec.deal_num && dealByNum[rec.deal_num] ? dealByNum[rec.deal_num] : null;
-      try {
-        // 1) сначала пробуем ЗАКРЫТЬ существующую незавершённую запись
-        // (тот же мастер+объект+день, где операция или доля ещё не определены) —
-        // так ответы мастеров на вопросы Сократа обновляют старые строки, а не плодят дубли
-        const upd = await pgPool.query(
-          `UPDATE work_log SET
-             operation = COALESCE($1, operation),
-             day_fraction = COALESCE($2, day_fraction),
-             confidence = $3, clarify = $4, clarify_question = $5
-           WHERE master = $6 AND COALESCE(object,'') = COALESCE($7,'') AND work_date = $8
-             AND (operation IS NULL OR day_fraction IS NULL)
-           RETURNING id`,
-          [rec.operation || null, rec.day_fraction === undefined ? null : rec.day_fraction,
-           rec.confidence || null, !!rec.clarify, rec.clarify_question || null,
-           rec.master || null, rec.object || null, rec.work_date || dateStr]
-        );
-        if (upd.rowCount > 0) { merged += upd.rowCount; continue; }
-        // 1б) уточнение уже отчитанного дня: есть запись того же мастер+объект+день+категория
-        // с иной формулировкой операции — обновляем её (берём более свежие операцию/долю),
-        // а не плодим дубль. Защищает от повторной привязки исправлений за прошлые дни.
-        if (rec.object) {
-          const same = await pgPool.query(
-            `SELECT id FROM work_log
-             WHERE master=$1 AND COALESCE(object,'')=COALESCE($2,'') AND work_date=$3 AND category=$4
-             ORDER BY created_at ASC LIMIT 1`,
-            [rec.master || null, rec.object || null, rec.work_date || dateStr, rec.category || null]);
-          if (same.rowCount > 0) {
-            await pgPool.query(
-              `UPDATE work_log SET operation=COALESCE($1,operation),
-                 day_fraction=$2, confidence=$3, clarify=$4, clarify_question=$5 WHERE id=$6`,
-              [rec.operation || null, rec.day_fraction === undefined ? 1.0 : rec.day_fraction,
-               rec.confidence || null, !!rec.clarify, rec.clarify_question || null, same.rows[0].id]);
-            merged++; continue;
-          }
-        }
-        // 2) незакрытой записи нет — вставляем новую
-        await pgPool.query(
-          `INSERT INTO work_log(tg_report_id, work_date, master, category, object, deal_id, operation, business_unit, day_fraction, confidence, clarify, clarify_question, raw_text, digest_date, created_at)
-           VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-           ON CONFLICT(master, object, work_date, operation) DO UPDATE SET
-             day_fraction=EXCLUDED.day_fraction, confidence=EXCLUDED.confidence,
-             clarify=EXCLUDED.clarify, clarify_question=EXCLUDED.clarify_question`,
-          [rec.tg_report_id || null, rec.work_date || dateStr, rec.master || null, rec.category || null,
-           rec.object || null, dealId, rec.operation || null, rec.business_unit || null,
-           rec.day_fraction === undefined ? 1.0 : rec.day_fraction, rec.confidence || null,
-           !!rec.clarify, rec.clarify_question || null, rec.raw_text || null, dateStr, Date.now()]
-        );
-        written++;
-      } catch (e) { console.log('⚠️ work_log insert:', e.message); }
-    }
+    const wr = await socratesWriteRecords(records, dateStr);
+    const written = wr.written, merged = wr.merged;
 
     // вопросы: дедуп по тексту (склеенный вопрос дублируется в нескольких записях)
     const seenQ = {};
@@ -3164,7 +3265,7 @@ app.get('/socrates/salary', async (req, res) => {
        GROUP BY master, category`, [from, to]);
     // детальные строки для раскрывающейся детализации по дням
     const det = await pgPool.query(
-      `SELECT work_date, master, category, object, operation, day_fraction
+      `SELECT work_date, master, category, object, operation, day_fraction, raw_text
        FROM work_log WHERE work_date >= $1 AND work_date <= $2 AND category <> 'ignore'
        ORDER BY master, work_date, id`, [from, to]);
     const detBy = {};
@@ -3202,23 +3303,22 @@ app.get('/socrates/salary', async (req, res) => {
       const teachCell = teach ? d3(teach) + ' <span class="mut">(' + money(teachPay) + ')</span>' : '';
       rows += '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + d3(prod) + '</td><td class="n">' + teachCell + '</td><td class="n">' + money(prodPay + teachPay) + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + money(pay) + '</td></tr>';
       // блок детализации: формула цифрами + записи по дням
-      const byDate = {};
-      for (const x of (detBy[m] || [])) { const k = String(x.work_date).slice(0,10); (byDate[k]=byDate[k]||[]).push(x); }
-      const lines = Object.keys(byDate).sort().map(k => {
-        const arr = byDate[k];
-        const dt = k.slice(5).split('-').reverse().join('.');
-        let daySum = 0, dayPay = 0;
-        const wRows = arr.map(x => {
-          const f = x.day_fraction === null ? null : Number(x.day_fraction);
-          const paid = (f !== null && x.category !== 'absence') ? f * rate * (x.category === 'teaching' ? SOC_TEACH_K : 1) : 0;
-          if (f !== null && x.category !== 'absence') daySum += f;
-          dayPay += paid;
-          const fs = f === null ? '<span class="warn">?</span>' : d3(f);
-          const cls = x.category === 'absence' ? ' class="ab"' : '';
-          return '<tr' + cls + '><td>' + (CATRU[x.category]||x.category) + '</td><td>' + socEsc(x.object||'—') + '</td><td class="op">' + socEsc((x.operation||'').slice(0,55)) + '</td><td class="n">' + fs + '</td><td class="n">' + (f===null?'':(Math.round(f*8*10)/10)+' ч') + '</td><td class="n">' + (paid?money(paid):'') + '</td></tr>';
-        }).join('');
-        return '<details class="ddet"><summary><span>' + dt + '</span><span class="dh">' + d3(daySum) + ' дн · ' + (Math.round(daySum*8*10)/10) + ' ч · ' + money(dayPay) + ' ₽</span></summary>' +
-          '<table class="dt"><tr><th>Категория</th><th>Объект / сделка</th><th>Операция</th><th style="text-align:right">Доля</th><th style="text-align:right">Часы</th><th style="text-align:right">Начислено, ₽</th></tr>' + wRows + '</table></details>';
+      const lines = (detBy[m] || []).map(x => {
+        const dt = String(x.work_date).slice(5, 10).split('-').reverse().join('.');
+        const f = x.day_fraction === null ? null : Number(x.day_fraction);
+        const isTeach = x.category === 'teaching';
+        const isAbs = x.category === 'absence';
+        const what = (x.object ? socEsc(x.object) + ' — ' : '') + socEsc(x.operation || (CATRU[x.category] || x.category));
+        const quote = x.raw_text ? '<div class="qt">«' + socEsc(String(x.raw_text).replace(/\s+/g, ' ').slice(0, 90)) + '»</div>' : '';
+        let calc = '', sum = '';
+        if (isAbs) { calc = '<span class="mut">не оплачивается</span>'; }
+        else if (f === null) { calc = '<span class="warn">доля не определена</span>'; }
+        else {
+          const pay = f * rate * (isTeach ? SOC_TEACH_K : 1);
+          calc = d3(f) + ' × ' + money(rate) + (isTeach ? ' × ' + SOC_TEACH_K : '');
+          sum = money(pay);
+        }
+        return '<tr' + (isAbs ? ' class="ab"' : '') + '><td class="dtd">' + dt + '</td><td>' + what + quote + '</td><td class="n calc">' + calc + '</td><td class="n">' + sum + '</td></tr>';
       }).join('');
       const formula =
         'Дневная ставка: ' + rnd(base) + ' / ' + wd + ' = <b>' + money(rate) + '</b> ₽/день<br>' +
@@ -3229,7 +3329,8 @@ app.get('/socrates/salary', async (req, res) => {
         '<br>ИТОГО: <b class="pay">' + money(pay) + '</b> ₽';
       detBlocks += '<details class="mdet"><summary><span class="sn">' + socEsc(m) + '</span><span class="sp">' + money(pay) + ' ₽</span></summary>' +
         '<div class="formula">' + formula + '</div>' +
-        '<div class="dwrap">' + lines + '</div></details>';
+        '<table class="dt flat"><tr><th>Дата</th><th>Что делал (цитата из отчёта)</th><th style="text-align:right">Расчёт</th><th style="text-align:right">Сумма, ₽</th></tr>' + lines +
+        '<tr class="msum"><td></td><td>ИТОГО' + (bonus ? ' (вкл. надбавку ' + rnd(bonus) + ')' : '') + '</td><td></td><td class="n pay">' + money(pay) + '</td></tr></table></details>';
     }
     // себестоимость сделок по ЗП мастеров: Σ(доля × дневная ставка мастера)
     const rateOf = {};
@@ -3274,6 +3375,9 @@ app.get('/socrates/salary', async (req, res) => {
       '.mdet[open] summary::before{content:"▾ "}.sn{font-weight:600}.sp{color:#A8853B;font-weight:700}' +
       '.formula{padding:10px 16px;background:#FBFAF7;border-top:1px solid #EFECE5;font-size:13px;line-height:1.8}' +
       '.dt{margin:0;border:none;width:100%}.dt th,.dt td{font-size:12px;padding:6px 10px}.dt .op{color:#6E6A63}' +
+      '.dt.flat{border-top:1px solid #EFECE5}.dt.flat td{vertical-align:top}.dtd{white-space:nowrap;color:#6E6A63}' +
+      '.qt{color:#8B867C;font-size:11px;margin-top:2px;font-style:italic}.calc{white-space:nowrap;color:#6E6A63;font-size:11.5px}' +
+      '.msum td{border-top:2px solid #C9A961;font-weight:700;background:#FBF8F1}' +
       '.dwrap{padding:4px 8px 8px 22px;background:#FBFAF7;border-top:1px solid #EFECE5}' +
       '.ddet{border:1px solid #EFECE5;border-top:none;background:#fff}.ddet:first-of-type{border-top:1px solid #EFECE5}' +
       '.ddet summary{display:flex;justify-content:space-between;padding:7px 10px;cursor:pointer;font-size:12.5px;list-style:none}' +
