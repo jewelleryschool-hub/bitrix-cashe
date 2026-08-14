@@ -53,6 +53,15 @@ async function initSocratesTables() {
   if (!pgPool) return;
   try {
     await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS socrates_memory (
+        id SERIAL PRIMARY KEY,
+        master TEXT,
+        kind TEXT,
+        date_from DATE,
+        date_to DATE,
+        note TEXT,
+        created_at BIGINT
+      );
       CREATE TABLE IF NOT EXISTS tg_reports (
         id BIGSERIAL PRIMARY KEY,
         update_id BIGINT UNIQUE,
@@ -2525,6 +2534,54 @@ const SOCRATES_MASTER_MAP = {
 };
 
 // устойчивое сопоставление telegram-автора с мастером (без регистра, по подстроке алиаса)
+// отпуска: SOCRATES_VACATION="Витя Комисар:2026-08-31,Имя:ГГГГ-ММ-ДД" — до даты включительно не пинать
+function socratesOnVacation(masterName, dateStr) {
+  const v = process.env.SOCRATES_VACATION || '';
+  for (const part of v.split(',')) {
+    const [n, until] = part.split(':').map(s => (s || '').trim());
+    if (n && until && n === masterName && dateStr <= until) return true;
+  }
+  return false;
+}
+async function socratesMemoryVacation(masterName, dateStr) {
+  if (!pgPool) return false;
+  try {
+    const r = await pgPool.query(
+      `SELECT 1 FROM socrates_memory WHERE master=$1 AND kind='vacation' AND date_from <= $2 AND date_to >= $2 LIMIT 1`,
+      [masterName, dateStr]);
+    return r.rowCount > 0;
+  } catch (e) { return false; }
+}
+async function socratesApplyFacts(facts, speak) {
+  if (!facts || !facts.length || !pgPool) return;
+  for (const f of facts) {
+    try {
+      if (!f.master || !f.kind || !f.date_from || !f.date_to) continue;
+      const cm = socratesMasterOf(f.master);
+      const mName = cm ? (Object.keys(SOCRATES_MASTER_MAP).find(k => SOCRATES_MASTER_MAP[k].call === cm.call) || f.master) : f.master;
+      await pgPool.query(
+        `INSERT INTO socrates_memory (master, kind, date_from, date_to, note, created_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+        [mName, f.kind, f.date_from, f.date_to, f.note || null, Date.now()]);
+      // отпуск/болезнь: сразу absence-строки на рабочие дни диапазона (зарплата учтёт)
+      if (f.kind === 'vacation' || f.kind === 'sick') {
+        const from = new Date(f.date_from + 'T12:00:00Z'), to = new Date(f.date_to + 'T12:00:00Z');
+        for (let d = new Date(from); d <= to; d.setUTCDate(d.getUTCDate() + 1)) {
+          if (d.getUTCDay() === 0 || d.getUTCDay() === 6) continue;
+          const ds = d.toISOString().slice(0, 10);
+          await pgPool.query(
+            `INSERT INTO work_log (work_date, master, category, operation, day_fraction, confidence, raw_text, digest_date, created_at)
+             SELECT $1,$2,'absence',$3,1.0,'memory',$4,$1,$5
+             WHERE NOT EXISTS (SELECT 1 FROM work_log WHERE work_date=$1 AND master=$2 AND category='absence')`,
+            [ds, mName, f.kind === 'sick' ? 'болезнь' : 'отпуск', f.note || '', Date.now()]);
+        }
+      }
+      if (speak && cm) {
+        const ends = f.date_to.slice(5).split('-').reverse().join('.');
+        await socratesSay('Понял, ' + cm.call + ' — записал: ' + (f.kind === 'sick' ? 'болезнь' : 'отпуск') + ' до ' + ends + '. Вопросов не будет, ' + (cm.gender === 'f' ? 'отдыхай' : 'отдыхай') + ' 🌴');
+      }
+    } catch (e) { console.log('facts:', e.message); }
+  }
+}
 function socratesMasterOf(author) {
   const a = String(author || '').toLowerCase().trim();
   if (!a) return null;
@@ -2622,9 +2679,10 @@ async function socratesClaudeParse(reports, deals, recentCtx) {
     '10. Дедуп: если один мастер в один день по одному объекту — одна запись, даже если сырьё дублируется.\n' +
     '11. В clarify_question обращайся по ИМЕНИ из карты обращений (Степан, Олег...), не по фамилии и не по telegram-нику.\n' +
     '12. СКЛЕЙКА ВОПРОСОВ: если у одного мастера по одному объекту несколько дней без операции — сформулируй ОДИН общий вопрос на все дни ("Степан, по 221 в ср-чт что делал?") и продублируй этот же текст в clarify_question каждой из этих записей. Не задавай отдельный вопрос на каждый день.\n\n' +
+    '13. ВАЖНЫЕ ФАКТЫ НА БУДУЩЕЕ: если мастер сообщает об отпуске/болезни/отгуле с датами или длительностью ("я на 5 дней в отпуск", "болею до пятницы", "с 20 по 24 меня не будет") — верни это отдельным полем facts (см. формат), рассчитав date_from/date_to от даты сообщения (СЕГОДНЯ/ЗАВТРА понимай буквально). Absence-записи на эти даты создавать НЕ нужно — система сделает сама из facts.\n\n' +
     'ВЕРНИ СТРОГО JSON-массив, по объекту на КАЖДУЮ запись work_log (не на входное сообщение): ' +
     '{"tg_report_id":число, "work_date":"YYYY-MM-DD", "master":"имя", "category":"...", "object":"... или null", "deal_num":"... или null", "operation":"... или null", "business_unit":"...", "day_fraction":число или null, "confidence":"...", "clarify":true/false, "clarify_question":"... или null", "raw_text":"исходная строка"}. ' +
-    'Только JSON, без пояснений и markdown.';
+    'Если есть важные факты — верни JSON-ОБЪЕКТ {"records":[...], "facts":[{"master":"имя","kind":"vacation|sick","date_from":"YYYY-MM-DD","date_to":"YYYY-MM-DD","note":"кратко"}]}, иначе просто массив records. Только JSON, без пояснений и markdown.';
 
   const model = process.env.ANALYSIS_MODEL || 'claude-opus-4-8';
   const ctxBlock = recentCtx && recentCtx.length
@@ -2651,7 +2709,8 @@ async function socratesClaudeParse(reports, deals, recentCtx) {
       }
       text = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
       const parsed = JSON.parse(text);
-      return { records: Array.isArray(parsed) ? parsed : [] };
+      if (Array.isArray(parsed)) return { records: parsed, facts: [] };
+      return { records: parsed.records || [], facts: parsed.facts || [] };
     } catch (e) {
       lastErr = String((e && e.message) || e);
       console.log('⚠️ socratesClaudeParse попытка ' + attempt + ':', lastErr);
@@ -2685,7 +2744,8 @@ async function socratesLiveTalk(call, gender, masterName, texts) {
     const sys = 'Ты — Сократ, дружелюбный учётчик ювелирной мастерской KARAKURKCHI-PLAKHOV в Telegram-группе мастеров. ' +
       'Отвечай кратко (1-3 предложения), по-русски, тепло, на «ты», без канцелярита, можно с лёгкой шуткой. ' +
       (gender === 'f' ? 'Собеседница — женщина, женский род. ' : '') +
-      'Обращайся: ' + call + '. Вопросы про учёт/дни — отвечай строго по данным ниже, не выдумывай. Нет данных — скажи честно.\n' +
+      'Обращайся: ' + call + '. Вопросы про учёт/дни/часы — отвечай строго по данным ниже, не выдумывай. Нет данных — скажи честно. ' +
+      'ДЕНЬГИ — ТАБУ: никогда не называй зарплаты, ставки, оклады, суммы выплат и себестоимость — ни свои расчёты, ни чужие. На такие вопросы отвечай: «по деньгам — к Роману, я считаю только дни и часы».\n' +
       'Записи мастера за 10 дней:\n' + (ctx || 'нет записей');
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -2732,10 +2792,13 @@ async function socratesLiveProcess(authorName) {
     const dealByNum = {};
     for (const d of deals) if (d.num) dealByNum[d.num] = d.id;
     const wr = await socratesWriteRecords(records, dateStr, dealByNum);
+    // электронный сотрудник: важные факты запоминает и подтверждает,
+    // вопросы задаёт когда надо (по делу), отчёты пишет молча
+    await socratesApplyFacts(parsed.facts, true);
     const clar = (parsed.clarifications || []).slice(0, 2);
-    if (clar.length) {
+    if (clar.length && !(await socratesMemoryVacation(masterName, dateStr))) {
       await socratesSendQuestions({ clarifications: clar }, true);
-    } else if (wr.written + wr.merged > 0) {
+    } else if ((process.env.SOCRATES_LIVE_ACK || '') === 'on' && wr.written + wr.merged > 0) {
       const parts = records.filter(r => r.day_fraction !== null && r.day_fraction !== undefined).slice(0, 4)
         .map(r => (r.object ? r.object + ' ' : '') + (r.operation || liveCatRu(r.category)) + ' ' + (Math.round(Number(r.day_fraction) * 8 * 10) / 10) + 'ч');
       if (parts.length) {
@@ -2910,6 +2973,7 @@ async function computeSocratesDigest(dateStr) {
     const records = parsed.records.filter(rec => rec.category !== 'ignore');
     const wr = await socratesWriteRecords(records, dateStr, dealByNum);
     const written = wr.written, merged = wr.merged;
+    await socratesApplyFacts(parsed.facts, false);
 
     // вопросы: дедуп по тексту (склеенный вопрос дублируется в нескольких записях)
     const seenQ = {};
@@ -2937,6 +3001,8 @@ async function computeSocratesDigest(dateStr) {
         if (!seenMasters[name]) {
           const m = SOCRATES_MASTER_MAP[name];
           missing.push(name);
+          if (socratesOnVacation(name, dateStr)) continue; // в отпуске (env) — не пинаем
+          if (await socratesMemoryVacation(name, dateStr)) continue; // в отпуске (память) — не пинаем
           const she = (m.gender === 'f');
           const nudges = [
             m.call + ', не вижу от тебя сводки за день — всё в порядке? Черкни пару слов, что было в работе',
@@ -2950,7 +3016,7 @@ async function computeSocratesDigest(dateStr) {
       }
     }
 
-    // переспрос: незакрытые вопросы прошлых дней (до 5 дней назад) повторяем, пока мастер не ответит
+    // переспрос: незакрытые вопросы прошлых дней (отпускники — пропуск в цикле ниже) (до 5 дней назад) повторяем, пока мастер не ответит
     try {
       const since = new Date(new Date(dateStr + 'T12:00:00Z').getTime() - 5 * 86400000).toISOString().slice(0, 10);
       // берём открытый вопрос ТОЛЬКО если по тому же мастеру и рабочему дню НЕТ ни одной
