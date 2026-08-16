@@ -3819,7 +3819,12 @@ app.get('/romeo-photos', async (req, res) => {
   try { const r = await sendCoursePhotos(dialog, course, n, req.query.caption || ''); res.json(r); }
   catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
-
+try {
+  require('./b2b_survey.js').mount(app, { WEBHOOK: WEBHOOK, fetch: fetch, pgPool: pgPool });
+  console.log('✓ B2B опрос смонтирован: /b2b-survey');
+} catch (e) {
+  console.log('⚠️ B2B опрос не подключён:', e.message);
+}
 // ============================================
 // STARTUP
 // ============================================
