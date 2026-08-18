@@ -2399,19 +2399,24 @@ async function joinSession(dialog) {
     await fetch(WEBHOOK + '/imopenlines.session.join.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ CHAT_ID: chatId }), timeout: 15000 });
   } catch (e) { /* join best-effort */ }
 }
-// один commit-попытка: copyto (+поиск дубля) -> commit
+// один commit-попытка. Чтобы не плодить копии при повторных отправках, СНАЧАЛА ищем уже готовую
+// копию файла в папке чата (по имени исходника); копируем только если её нет.
 async function tryCommitPhoto(dialog, fileId, chatFolderId, caption) {
-  const cpr = await fetch(WEBHOOK + '/disk.file.copyto.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: fileId, targetFolderId: chatFolderId }), timeout: 30000 });
-  const cpj = await cpr.json();
-  let newId = cpj.result && cpj.result.ID;
-  // DISK_OBJ_22000 = файл уже был скопирован ранее; найдём копию в папке чата
-  if (!newId && cpj.error === 'DISK_OBJ_22000') {
-    const lr = await fetch(WEBHOOK + '/disk.folder.getchildren.json?id=' + chatFolderId, { timeout: 15000 });
-    const lj = await lr.json();
-    const src = (lj.result || []).find(f => String(f.NAME || '').indexOf(String(fileId)) !== -1);
-    if (src) newId = src.ID;
+  let newId = null;
+  // имя исходного файла (для поиска существующей копии)
+  const srcInfo = await fetch(WEBHOOK + '/disk.file.get.json?id=' + fileId, { timeout: 15000 }).then(x => x.json()).catch(() => ({}));
+  const baseName = String((srcInfo.result && srcInfo.result.NAME) || '').replace(/\.[^.]+$/, '');
+  // ищем готовую копию в папке чата
+  const lr = await fetch(WEBHOOK + '/disk.folder.getchildren.json?id=' + chatFolderId, { timeout: 15000 }).then(x => x.json()).catch(() => ({}));
+  const existing = (lr.result || []).filter(f => baseName && String(f.NAME || '').indexOf(baseName) === 0);
+  if (existing.length) { existing.sort((a, b) => Number(a.ID) - Number(b.ID)); newId = existing[0].ID; }
+  // копии нет — копируем исходник в папку чата
+  if (!newId) {
+    const cpr = await fetch(WEBHOOK + '/disk.file.copyto.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: fileId, targetFolderId: chatFolderId }), timeout: 30000 });
+    const cpj = await cpr.json();
+    newId = cpj.result && cpj.result.ID;
+    if (!newId) return { ok: false, step: 'copyto', error: (cpj.error || 'copy failed') + (cpj.error_description ? ': ' + cpj.error_description : '') };
   }
-  if (!newId) return { ok: false, step: 'copyto', error: (cpj.error || 'copy failed') + (cpj.error_description ? ': ' + cpj.error_description : '') };
   const body = { DIALOG_ID: dialog, FILE_ID: newId, MESSAGE: caption || '' };
   const cmr = await fetch(WEBHOOK + '/im.disk.file.commit.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeout: 15000 });
   const cmj = await cmr.json();
