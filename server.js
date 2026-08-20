@@ -2711,7 +2711,8 @@ async function socratesClaudeParse(reports, deals, recentCtx) {
   if (!key) return { error: 'NO_KEY' };
   const dealCatalog = deals.filter(d => d.num).map(d => d.num + '|' + d.title).join('\n');
   const knownObjects = 'Ножи PlakhovArt: Адъютант, Гунгнир, Грач, Готика, Буля, Консул, Моисей. ' +
-    'Худож. проекты: Нуво, Папоротник, Брошка титан, Кошка, Львица, Подсолнух.';
+    'Худож. проекты: Нуво, Папоротник, Кошка, Львица, Подсолнух. ' +
+    'ВАЖНО: «Подсолнух» — титановая брошь; слова «брошка», «брошь титан», «брошка титан», «брошка подсолнух» = объект «Подсолнух» (одно изделие, канон — Подсолнух).';
   const namesLine = 'Обращения к мастерам в вопросах: ' +
     Object.entries(SOCRATES_MASTER_MAP).map(([name, m]) => name + ' = ' + m.call).join(', ') +
     '. Автор в отчёте может быть написан ником или сокращённо (ERSHOV, Oleg, Viktor K) — соотнеси с мастером по смыслу.';
