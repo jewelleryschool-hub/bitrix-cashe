@@ -2522,6 +2522,80 @@ app.get('/socrates/reports', async (req, res) => {
 // Читает сырьё из tg_reports за дату, матчит к живым сделкам C46/C48/PlakhovArt,
 // раскладывает в work_log, помечает clarify для непонятных.
 // ============================================
+// ===== РОМЕО: доставка маршрутов обучения в Instagram =====
+// (Bitrix требует, чтобы отправитель был участником чата ОЛ).
+async function joinSession(dialog) {
+  const chatId = String(dialog || '').replace(/[^0-9]/g, '');
+  if (!chatId) return;
+  try {
+    await fetch(WEBHOOK + '/imopenlines.session.join.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ CHAT_ID: chatId }), timeout: 15000 });
+  } catch (e) { /* join best-effort */ }
+}
+// один commit-попытка. Чтобы не плодить копии при повторных отправках, СНАЧАЛА ищем уже готовую
+// копию файла в папке чата (по имени исходника); копируем только если её нет.
+
+// копию файла в папке чата (по имени исходника); копируем только если её нет.
+async function tryCommitPhoto(dialog, fileId, chatFolderId, caption) {
+  let newId = null;
+  // имя исходного файла (для поиска существующей копии)
+  const srcInfo = await fetch(WEBHOOK + '/disk.file.get.json?id=' + fileId, { timeout: 15000 }).then(x => x.json()).catch(() => ({}));
+  const baseName = String((srcInfo.result && srcInfo.result.NAME) || '').replace(/\.[^.]+$/, '');
+  // ищем готовую копию в папке чата
+  const lr = await fetch(WEBHOOK + '/disk.folder.getchildren.json?id=' + chatFolderId, { timeout: 15000 }).then(x => x.json()).catch(() => ({}));
+  const existing = (lr.result || []).filter(f => baseName && String(f.NAME || '').indexOf(baseName) === 0);
+  if (existing.length) { existing.sort((a, b) => Number(a.ID) - Number(b.ID)); newId = existing[0].ID; }
+  // копии нет — копируем исходник в папку чата
+  if (!newId) {
+    const cpr = await fetch(WEBHOOK + '/disk.file.copyto.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: fileId, targetFolderId: chatFolderId }), timeout: 30000 });
+    const cpj = await cpr.json();
+    newId = cpj.result && cpj.result.ID;
+    if (!newId) return { ok: false, step: 'copyto', error: (cpj.error || 'copy failed') + (cpj.error_description ? ': ' + cpj.error_description : '') };
+  }
+  const body = { DIALOG_ID: dialog, FILE_ID: newId, MESSAGE: caption || '' };
+  const cmr = await fetch(WEBHOOK + '/im.disk.file.commit.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeout: 15000 });
+  const cmj = await cmr.json();
+  return { ok: !!(cmj.result), commitError: cmj.error || null, error: cmj.error ? (cmj.error + ': ' + (cmj.error_description || '')) : null };
+}
+// commit-first: пробуем сразу; join делаем ТОЛЬКО если нет доступа к чату (ACCESS_ERROR).
+// Так системная запись "оператор присоединился" появляется максимум один раз на диалог,
+// а не при каждой отправке фото.
+
+// язык диалога -> файл: ru/es свой, всё остальное (en и любой другой) -> en
+function routeFileForLang(lang) {
+  const l = String(lang || '').toLowerCase();
+  if (l === 'ru' || l === 'russian' || l === 'русский') return ROUTE_FILES.ru;
+  if (l === 'es' || l === 'spanish' || l === 'español' || l === 'espanol') return ROUTE_FILES.es;
+  return ROUTE_FILES.en;
+}
+
+// язык диалога -> файл: ru/es свой, всё остальное (en и любой другой) -> en
+function routeFileForLang(lang) {
+  const l = String(lang || '').toLowerCase();
+  if (l === 'ru' || l === 'russian' || l === 'русский') return ROUTE_FILES.ru;
+  if (l === 'es' || l === 'spanish' || l === 'español' || l === 'espanol') return ROUTE_FILES.es;
+  return ROUTE_FILES.en;
+}
+async function sendRoute(dialog, lang) {
+  const fileId = routeFileForLang(lang);
+  const chatFolderId = await getChatFolderId(dialog);
+  if (!chatFolderId) return { ok: false, error: 'нет папки чата' };
+  // чистое фото: caption пустой (commit принимает пустой MESSAGE)
+  return await sendChatPhoto(dialog, fileId, chatFolderId, '');
+}
+// точка вызова из n8n / ручной тест:
+//   /send-route?dialog=chatNNNN&lang=ru&key=PHOTO_KEY
+
+app.get('/send-route', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key=PHOTO_KEY' });
+  const dialog = req.query.dialog, lang = req.query.lang || 'ru';
+  if (!dialog) return res.status(400).json({ error: 'нужен ?dialog=chatNNNN' });
+  try {
+    const r = await sendRoute(dialog, lang);
+    res.json({ sent: r.ok, file: routeFileForLang(lang), lang: lang, error: r.error });
+  } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
+});
+// ===== конец РОМЕО =====
+
 const SOCRATES_MASTER_MAP = {
   // каноничное имя -> { call: обращение, gender: род для окончаний, aliases: варианты написания }
   // это же — ростер мастеров, от которых ждём ежедневный отчёт (кроме выходных)
