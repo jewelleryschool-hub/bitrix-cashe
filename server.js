@@ -3318,6 +3318,40 @@ app.get('/socrates/report', async (req, res) => {
         '<div class="dwrap">'+dateBlocks+'</div></details>';
     }).join('');
 
+    // все незакрытые сделки Bitrix + активность по ним за всё время
+    let openDealRows = '';
+    try {
+      const odeals = await socratesLoadDeals();
+      const act = {};
+      const ar = await pgPool.query(
+        `SELECT object, MAX(work_date) AS last, SUM(COALESCE(day_fraction,0))*8 AS hrs
+         FROM work_log WHERE category='deal' AND object IS NOT NULL GROUP BY object`);
+      for (const a of ar.rows) act[a.object] = { last: socIsoDate(a.last), hrs: Number(a.hrs || 0) };
+      const seen = {}; const list = [];
+      for (const dl of odeals) {
+        const key = dl.num || dl.title;
+        if (seen[key]) continue; seen[key] = 1;
+        const mo = dl.num && objects[dl.num] ? objects[dl.num] : null;
+        const a = dl.num && act[dl.num] ? act[dl.num] : null;
+        list.push({ num: dl.num, title: dl.title, mh: mo ? mo.days * 8 : 0, th: a ? a.hrs : 0,
+          last: a ? a.last : null,
+          who: mo ? Object.entries(mo.who).map(([nm,v])=>nm.split(' ')[0]+' '+(Math.round(v*8*10)/10)+'ч').join(', ') : '' });
+      }
+      list.sort((x,y)=> (y.mh - x.mh) || String(y.last||'').localeCompare(String(x.last||'')));
+      const todayMs = Date.now() + 3*3600000;
+      const trs = list.map(x=>{
+        const stale = !x.last || (todayMs - new Date(x.last+'T12:00:00Z').getTime())/86400000 > 14;
+        const lastTxt = x.last ? x.last.slice(5).split('-').reverse().join('.') : 'не начата';
+        return '<tr'+(stale?' class="stale"':'')+'><td class="nm">'+(x.num?'#'+x.num+' ':'')+socEsc(x.title)+'</td>'+
+          '<td class="n">'+(x.mh?Math.round(x.mh*10)/10+' ч':'—')+'</td>'+
+          '<td class="n">'+(x.th?Math.round(x.th*10)/10+' ч':'—')+'</td>'+
+          '<td class="n'+(stale?' warn':'')+'">'+lastTxt+'</td>'+
+          '<td class="mut" style="font-size:11px">'+x.who+'</td></tr>';
+      }).join('');
+      openDealRows = '<h2>Незакрытые сделки ('+list.length+')</h2>'+
+        '<table><tr><th>Сделка</th><th style="text-align:right">Часы за месяц</th><th style="text-align:right">Часы всего</th><th style="text-align:right">Последняя работа</th><th>Кто в этом месяце</th></tr>'+trs+'</table>'+
+        '<div class="mut" style="margin:6px 0 14px;font-size:11.5px">Подсвечены сделки без движения больше 14 дней или не начатые.</div>';
+    } catch (e) { openDealRows = '<div class="mut">Сделки Bitrix недоступны: '+socEsc(String(e.message||e))+'</div>'; }
     const maxObj = Math.max(1, ...Object.values(objects).map(o=>o.days));
     const oRows = Object.keys(objects).sort((a,b)=>objects[b].days-objects[a].days).slice(0,25).map(o=>{
       const x=objects[o]; const w=Math.round((x.days/maxObj)*100);
@@ -3363,6 +3397,7 @@ app.get('/socrates/report', async (req, res) => {
     '.ddet summary::-webkit-details-marker{display:none}.ddet summary::before{content:"▸ ";color:#A8853B}'+
     '.ddet[open] summary::before{content:"▾ "}.dh{color:#A8853B;font-weight:600}'+
     '.dt .op{color:#6E6A63}.dt .ab td{color:#9a6700;background:#FDF9F0}'+
+    '.stale td{background:#FDF6F0}.stale .warn,.n.warn{color:#b45309;font-weight:600}'+
     '.mut{color:#6E6A63;font-size:13px}.foot{color:#8B867C;font-size:11.5px;margin:26px 0 40px}'+
     '</style></head><body>'+
     '<div class="hero"><div class="wrap"><h1>Мастерская KARAKURKCHI-PLAKHOV</h1><div class="sub">Итоги: '+socEsc(title)+'</div>'+
@@ -3372,7 +3407,7 @@ app.get('/socrates/report', async (req, res) => {
     '<div class="ghead"><span class="gc nm">Мастер</span><span class="gc">Произв.</span><span class="gc">Авторские</span><span class="gc">Курс</span><span class="gc">Орг</span><span class="gc">Отсут.</span><span class="gc tot">Дней</span><span class="gc"></span></div>'+
     (mRows||'<div class="mut">Нет данных за месяц</div>')+
     '<div class="mut" style="margin-top:6px;font-size:11.5px">Нажмите на мастера, чтобы развернуть записи по дням.</div>'+
-    '<h2>Сделки и изделия: часы мастеров</h2>'+oRows+
+    openDealRows+'<h2>Сделки и изделия: часы мастеров</h2>'+oRows+
     '<h2>Открытые уточнения</h2>'+pRows+
     '<h2>Преподавание (курс)</h2>'+(Object.keys(masters).filter(m=>(masters[m].days.teaching||0)>0).sort((a,b)=>(masters[b].days.teaching||0)-(masters[a].days.teaching||0)).map(m=>'<div class="orow"><div class="on">'+socEsc(m)+'</div><div class="od">'+(Math.round((masters[m].days.teaching||0)*10)/10)+' дн</div></div>').join('')||'<div class="mut">Дней преподавания за месяц нет</div>')+
     '<div class="foot">Источник: ежедневные отчёты мастеров в Telegram, разбор Сократа. Рабочих дней в месяце: '+wd+'. Дни в таблице — сумма учтённых долей; «без долей» — записи, ждущие распределения от мастера.</div>'+
