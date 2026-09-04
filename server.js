@@ -3245,8 +3245,17 @@ function socIsoDate(v) {
   return String(v || '').slice(0, 10);
 }
 function socEsc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
-function socWorkdays(month){ // будних дней в месяце YYYY-MM
+// Производственный календарь РФ (пятидневка): норма рабочих дней по месяцам.
+// Источник: consultant.ru/law/ref/calendar/proizvodstvennye. Годовая норма 2026 = 247.
+const SOC_PROD_CALENDAR = {
+  '2026': { 1:15, 2:19, 3:22, 4:22, 5:18, 6:21, 7:23, 8:21, 9:22, 10:22, 11:20, 12:22 },
+  '2025': { 1:17, 2:20, 3:21, 4:22, 5:18, 6:19, 7:23, 8:21, 9:22, 10:23, 11:19, 12:22 }
+};
+function socWorkdays(month){ // рабочих дней в YYYY-MM по производственному календарю
   const [y,m]=month.split('-').map(Number);
+  const cal = SOC_PROD_CALENDAR[String(y)];
+  if (cal && cal[m]) return cal[m];
+  // нет в таблице — считаем будни (без праздников), лучше чем ничего
   let n=0; const d=new Date(Date.UTC(y,m-1,1));
   while(d.getUTCMonth()===m-1){ const w=d.getUTCDay(); if(w!==0&&w!==6)n++; d.setUTCDate(d.getUTCDate()+1); }
   return n;
@@ -3397,7 +3406,7 @@ app.get('/socrates/report', async (req, res) => {
     '<h2>Сделки и изделия: часы мастеров (с начала года)</h2>'+oRows+
     '<h2>Открытые уточнения</h2>'+pRows+
     '<h2>Преподавание (курс)</h2>'+(Object.keys(masters).filter(m=>(masters[m].days.teaching||0)>0).sort((a,b)=>(masters[b].days.teaching||0)-(masters[a].days.teaching||0)).map(m=>'<div class="orow"><div class="on">'+socEsc(m)+'</div><div class="od">'+(Math.round((masters[m].days.teaching||0)*10)/10)+' дн</div></div>').join('')||'<div class="mut">Дней преподавания за месяц нет</div>')+
-    '<div class="foot">Источник: ежедневные отчёты мастеров в Telegram, разбор Сократа. Рабочих дней в месяце: '+wd+'. Дни в таблице — сумма учтённых долей; «без долей» — записи, ждущие распределения от мастера.</div>'+
+    '<div class="foot">Источник: ежедневные отчёты мастеров в Telegram, разбор Сократа. Рабочих дней в месяце (произв. календарь): '+socWorkdays(month)+'. Дни в таблице — сумма учтённых долей; «без долей» — записи, ждущие распределения от мастера.</div>'+
     '</div></body></html>');
   } catch (e) { res.send('Ошибка: '+socEsc(e.message)); }
 });
@@ -3426,7 +3435,12 @@ app.get('/socrates/salary', async (req, res) => {
   const to = new Date(Date.UTC(sy, sm, 0)).toISOString().slice(0, 10);
   let salary = SOC_SALARY_DEFAULT;
   try { if (process.env.SOCRATES_SALARY) salary = JSON.parse(process.env.SOCRATES_SALARY); } catch (e) {}
-  const wd = parseInt(req.query.wd || '0', 10) || socWorkdays(month);
+  const wdCal = socWorkdays(month);
+  const wdManual = parseInt(req.query.wd || '0', 10) || 0;
+  const wd = wdManual || wdCal;
+  const wdNote = wdManual && wdManual !== wdCal
+    ? ' <span class="warn">(вручную ' + wdManual + '; по производственному календарю ' + wdCal + ' — проверь ссылку!)</span>'
+    : ' (производственный календарь)';
   try {
     const r = await pgPool.query(
       `SELECT master, category, SUM(COALESCE(day_fraction,0)) AS days
@@ -3554,7 +3568,7 @@ app.get('/socrates/salary', async (req, res) => {
       '.ddet[open] summary::before{content:"▾ "}.dh{color:#A8853B;font-weight:600}' +
       '.dt .ab td{color:#9a6700;background:#FDF9F0}.warn{color:#b00}' +
       '</style></head><body>' +
-      '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + '</div></div></div>' +
+      '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + wdNote + '</div></div></div>' +
       '<div class="wrap">' +
       '<table><tr><th>Мастер</th><th style="text-align:right">Оклад</th><th style="text-align:right">Произв. дн</th><th style="text-align:right">Курс дн (оплата)</th><th style="text-align:right">За дни, руб</th><th style="text-align:right">Надбавка</th><th style="text-align:right">К выплате, руб</th></tr>' +
       rows +
