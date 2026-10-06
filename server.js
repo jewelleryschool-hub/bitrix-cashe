@@ -2568,13 +2568,6 @@ function routeFileForLang(lang) {
   return ROUTE_FILES.en;
 }
 
-// язык диалога -> файл: ru/es свой, всё остальное (en и любой другой) -> en
-function routeFileForLang(lang) {
-  const l = String(lang || '').toLowerCase();
-  if (l === 'ru' || l === 'russian' || l === 'русский') return ROUTE_FILES.ru;
-  if (l === 'es' || l === 'spanish' || l === 'español' || l === 'espanol') return ROUTE_FILES.es;
-  return ROUTE_FILES.en;
-}
 async function sendRoute(dialog, lang) {
   const fileId = routeFileForLang(lang);
   const chatFolderId = await getChatFolderId(dialog);
@@ -3963,14 +3956,14 @@ async function getChatFolderId(dialog) {
   return j.result && j.result.ID;
 }
 async function sendChatPhoto(dialog, fileId, chatFolderId, caption) {
-  const cpr = await fetch(WEBHOOK + '/disk.file.copyto.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: fileId, targetFolderId: chatFolderId }), timeout: 30000 });
-  const cpj = await cpr.json();
-  const newId = cpj.result && cpj.result.ID;
-  if (!newId) return { ok: false, step: 'copyto', error: (cpj.error || 'copy failed') + (cpj.error_description ? ': ' + cpj.error_description : '') };
-  const body = { DIALOG_ID: dialog, FILE_ID: newId, MESSAGE: caption || '' };
-  const cmr = await fetch(WEBHOOK + '/im.disk.file.commit.json', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeout: 15000 });
-  const cmj = await cmr.json();
-  return { ok: !!(cmj.result), error: cmj.error ? (cmj.error + ': ' + (cmj.error_description || '')) : null };
+  let r = await tryCommitPhoto(dialog, fileId, chatFolderId, caption);
+  if (r.ok) return { ok: true, error: null };
+  // нет доступа к чату -> присоединяемся и пробуем ещё раз
+  if (r.commitError === 'ACCESS_ERROR' || (r.step === 'copyto' && /ACCESS_DENIED/i.test(r.error || ''))) {
+    await joinSession(dialog);
+    r = await tryCommitPhoto(dialog, fileId, chatFolderId, caption);
+  }
+  return { ok: r.ok, error: r.error };
 }
 // курс → папка → отправка картинок. course = имя папки (как в «образцы курсов»), n = сколько (макс 5)
 async function sendCoursePhotos(dialog, course, n, caption) {
