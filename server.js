@@ -89,6 +89,11 @@ async function initWorkLogTable() {
   if (!pgPool) return;
   try {
     await pgPool.query(`
+      CREATE TABLE IF NOT EXISTS socrates_users (
+        name TEXT PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        started_at TIMESTAMPTZ DEFAULT now()
+      );
       CREATE TABLE IF NOT EXISTS work_log (
         id BIGSERIAL PRIMARY KEY,
         tg_report_id BIGINT,
@@ -2429,9 +2434,61 @@ app.get('/text-test', async (req, res) => {
 // Защита: секретный заголовок Telegram + фильтр по chat_id группы.
 // ============================================
 const TG_SOCRATES_TOKEN = process.env.TG_SOCRATES_TOKEN || '';
+// Личные сообщения Сократа. Админ (Роман) — TG id из экспорта группы.
+const SOC_ADMIN_TG = Number(process.env.SOC_ADMIN_TG || 639698476);
+const SOC_BASE_URL = 'https://bitrix-cashe-production.up.railway.app';
+let socUsers = {}; // canonical name -> tg user_id (кто нажал Start в личке)
+async function socLoadUsers() {
+  if (!pgPool) return;
+  try { const r = await pgPool.query('SELECT name, user_id FROM socrates_users'); socUsers = {}; for (const x of r.rows) socUsers[x.name] = Number(x.user_id); console.log('✓ Сократ: личек подключено', Object.keys(socUsers).length); } catch (e) { console.log('socLoadUsers:', e.message); }
+}
+async function socSendDM(userId, text) {
+  if (!TG_SOCRATES_TOKEN || !userId) return { ok: false, error: 'нет токена или user_id' };
+  try {
+    const r = await fetch('https://api.telegram.org/bot' + TG_SOCRATES_TOKEN + '/sendMessage', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: userId, text: text, disable_web_page_preview: true }), timeout: 15000 });
+    const j = await r.json();
+    return { ok: !!j.ok, error: j.ok ? null : (j.description || 'send failed') };
+  } catch (e) { return { ok: false, error: String(e.message || e) }; }
+}
+function socMySalaryLink(name, month) {
+  const t = require('crypto').createHash('sha256').update((process.env.PHOTO_KEY || '') + '|' + name).digest('hex').slice(0, 10);
+  return SOC_BASE_URL + '/socrates/my-salary?month=' + month + '&m=' + encodeURIComponent(name) + '&t=' + t;
+}
+function socAuditBadge() {
+  const a = cache['soc_week_audit'];
+  if (!a || !a.week_of) return '';
+  return a.issues && a.issues.length
+    ? ' · <span style="color:#b45309">сверка нед. ' + a.week_of.slice(5) + ': ' + a.issues.length + ' расхожд.</span>'
+    : ' · <span style="color:#2da44e">сверка нед. ' + a.week_of.slice(5) + ' пройдена</span>';
+}
+function socPrevMonth() { const d = new Date(Date.now() + 3*3600000); d.setUTCDate(1); d.setUTCDate(0); return d.toISOString().slice(0, 7); }
+function socCurMonth() { return new Date(Date.now() + 3*3600000).toISOString().slice(0, 7); }
+
 const TG_SOCRATES_SECRET = process.env.TG_SOCRATES_SECRET || '';
 const TG_SOCRATES_CHAT = process.env.TG_SOCRATES_CHAT || '-1004300239646';
 
+// ручная отправка ЛС: /socrates/dm?key=PHOTO_KEY&to=Роман|имя мастера|all&text=...  (text опционален: без него шлёт ссылку на ЗП)
+app.get('/socrates/dm', async (req, res) => {
+  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).json({ error: 'нужен ?key' });
+  const to = String(req.query.to || 'Роман');
+  const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : socPrevMonth();
+  const results = [];
+  const sendOne = async (nm) => {
+    const uid = socUsers[nm];
+    if (!uid) { results.push({ to: nm, ok: false, error: 'не нажал Start' }); return; }
+    const text = req.query.text ? String(req.query.text)
+      : (nm === 'Роман'
+        ? ('Отчёт по ЗП за ' + month + ':' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + month + '&key=' + (process.env.PHOTO_KEY || ''))
+        : ('Ваш расчёт за ' + month + ':' + String.fromCharCode(10) + socMySalaryLink(nm, month)));
+    const r = await socSendDM(uid, text);
+    results.push({ to: nm, ok: r.ok, error: r.error });
+  };
+  if (to === 'all') { for (const nm of Object.keys(socUsers)) { await sendOne(nm); await new Promise(r => setTimeout(r, 300)); } }
+  else await sendOne(to);
+  res.json({ month: month, connected: Object.keys(socUsers), results: results });
+});
 app.post('/socrates/tg', async (req, res) => {
   // 1) проверка секрета Telegram (заголовок задаётся при setWebhook)
   if (TG_SOCRATES_SECRET) {
@@ -2450,6 +2507,72 @@ app.post('/socrates/tg', async (req, res) => {
     if (!msg) return;
 
     const chatId = msg.chat && msg.chat.id;
+    // ЛИЧКА: /start подключает личные сообщения (Роман и мастера)
+    if (msg.chat && msg.chat.type === 'private') {
+      const from = msg.from || {};
+      const uid = Number(from.id);
+      const txt = String(msg.text || '').trim();
+      const fname = [from.first_name, from.last_name].filter(Boolean).join(' ');
+      let canon = null;
+      if (uid === SOC_ADMIN_TG) canon = 'Роман';
+      else if (pgPool) {
+        // ЖЕЛЕЗНАЯ привязка: этот user_id должен был писать в группу отчётов.
+        // Берём его имя ИЗ ГРУППЫ (а не из профиля) и матчим по ростеру.
+        try {
+          const gr = await pgPool.query('SELECT author_name, COUNT(*) c FROM tg_reports WHERE author_id=$1 GROUP BY author_name ORDER BY c DESC LIMIT 1', [uid]);
+          if (gr.rows.length) {
+            const glow = String(gr.rows[0].author_name || '').toLowerCase();
+            for (const [nm, info] of Object.entries(SOCRATES_MASTER_MAP)) {
+              if (info.aliases.some(al => glow.indexOf(al) !== -1)) { canon = nm; break; }
+            }
+          }
+        } catch (e) { console.log('canon lookup:', e.message); }
+      }
+      if (/^\/start/.test(txt)) {
+        if (canon && pgPool) {
+          try { await pgPool.query('INSERT INTO socrates_users(name,user_id) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET user_id=EXCLUDED.user_id', [canon, uid]); socUsers[canon] = uid; } catch (e) { console.log('users upsert:', e.message); }
+          if (canon === 'Роман') {
+            await socSendDM(uid, 'Личный канал подключён. Здесь будут: ссылки на отчёты по ЗП, тревоги вебхука и еженедельная сверка.' + String.fromCharCode(10) + String.fromCharCode(10) + 'Отчёт по зарплате за ' + socPrevMonth() + ':' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + socPrevMonth() + '&key=' + (process.env.PHOTO_KEY || ''));
+          } else {
+            await socSendDM(uid, 'Личный канал подключён, ' + (SOCRATES_MASTER_MAP[canon].call) + '. Ваш персональный расчёт за ' + socPrevMonth() + ':' + String.fromCharCode(10) + socMySalaryLink(canon, socPrevMonth()) + String.fromCharCode(10) + 'Чужие данные по этой ссылке не видны.');
+          }
+        } else {
+          await socSendDM(uid, 'Я Сократ, учёт мастерской. Заявка на подключение отправлена Роману — как подтвердит, пришлю ваш расчёт.');
+          if (socUsers['Роман']) await socSendDM(socUsers['Роман'], '🔔 Start в личке от «' + (fname || from.username || '?') + '» (id ' + uid + '), в группе отчётов его сообщений не нашёл. Если это наш — ответь мне: привязать ' + uid + ' Имя Фамилия (точно как в ростере).');
+        }
+        return;
+      }
+      if (canon === 'Роман') {
+        const mb = txt.match(/^привязать\s+(\d+)\s+(.+)$/i);
+        if (mb && pgPool) {
+          const tgt = mb[2].trim();
+          if (SOCRATES_MASTER_MAP[tgt]) {
+            await pgPool.query('INSERT INTO socrates_users(name,user_id) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET user_id=EXCLUDED.user_id', [tgt, Number(mb[1])]);
+            socUsers[tgt] = Number(mb[1]);
+            await socSendDM(uid, '✓ Привязал: ' + tgt + ' → id ' + mb[1]);
+            await socSendDM(Number(mb[1]), 'Роман подтвердил подключение. Ваш расчёт за ' + socPrevMonth() + ':' + String.fromCharCode(10) + socMySalaryLink(tgt, socPrevMonth()));
+          } else {
+            await socSendDM(uid, 'Не нашёл «' + tgt + '» в ростере. Точные имена: ' + Object.keys(SOCRATES_MASTER_MAP).join(', '));
+          }
+          return;
+        }
+        const mu = txt.match(/^отвязать\s+(.+)$/i);
+        if (mu && pgPool) {
+          const tgt = mu[1].trim();
+          await pgPool.query('DELETE FROM socrates_users WHERE name=$1', [tgt]);
+          delete socUsers[tgt];
+          await socSendDM(uid, '✓ Отвязал: ' + tgt);
+          return;
+        }
+      }
+      if (/зарплат|salary|расч[её]т/i.test(txt) && canon) {
+        const mth = socCurMonth();
+        const link = canon === 'Роман' ? (SOC_BASE_URL + '/socrates/salary?month=' + mth + '&key=' + (process.env.PHOTO_KEY || '')) : socMySalaryLink(canon, mth);
+        await socSendDM(uid, 'Расчёт за ' + mth + ':' + String.fromCharCode(10) + link);
+        return;
+      }
+      return; // прочее в личке не обрабатываем
+    }
     // 2) фильтр: принимаем только нашу группу
     if (String(chatId) !== String(TG_SOCRATES_CHAT)) {
       console.log('ℹ️ socrates/tg: чужой chat_id', chatId, '— игнор');
@@ -2708,7 +2831,8 @@ async function socratesClaudeParse(reports, deals, recentCtx) {
   if (!key) return { error: 'NO_KEY' };
   const dealCatalog = deals.filter(d => d.num).map(d => d.num + '|' + d.title).join('\n');
   const knownObjects = 'Ножи PlakhovArt: Адъютант, Гунгнир, Грач, Готика, Буля, Консул, Моисей. ' +
-    'Худож. проекты: Нуво, Папоротник, Кошка, Львица, Подсолнух. ' +
+    'Худож. проекты: Нуво, Папоротник, Кошка, Львица, Подсолнух, Консул, Тюльпан; ножи: Адъютант классик, Грач, Гунгнир. ' +
+    'ПРАВИЛА ХРОНОЛОГИИ: (1) Пачка строк «Пн:/Вт:/Ср:…» без дат, присланная задним числом, относится к ПРОДОЛЖЕНИЮ хроники этого мастера — дни идут подряд после его последнего отчитанного дня, НЕ от даты отправки. (2) Сообщение-уточнение без даты, чей состав работ совпадает с уже отчитанным днём — это ЗАМЕНА того дня (перезапиши день по новой версии), а не новый день. (3) «Рабочий день N часов» — финальный итог дня: если компоненты в сумме не сходятся с N, подгони компоненты под N (итог мастера главнее). (4) Несколько версий отчёта за один день — действует ПОСЛЕДНЯЯ, прежние записи дня удаляются. (5) Многодневная сводка с датами внутри («07.09 … 8 часов» на каждой строке) разбирается построчно по датам из текста. (6) Обучение СВОИХ сотрудников (мастер-класс для своих, наставничество) — обычная ставка, category=orgwork; teaching с коэффициентом — только внешний курс студентам. ' +
     'ВАЖНО про «Подсолнух» (титановая брошь, ЗАКОНЧЕН 20.08.2026): ТОЛЬКО для работ с датой ДО 20.08.2026 включительно слова «брошка», «брошь титан», «брошка титан», «брошка подсолнух» = объект «Подсолнух». Для работ ПОСЛЕ этой даты правило НЕ действует — «брошка» это новое изделие, уточняй какое/номер.';
   const namesLine = 'Обращения к мастерам в вопросах: ' +
     Object.entries(SOCRATES_MASTER_MAP).map(([name, m]) => name + ' = ' + m.call).join(', ') +
@@ -3439,7 +3563,7 @@ app.get('/socrates/my-salary', async (req, res) => {
   const wd = socWorkdays(month);
   const rate = base / wd;
   const money = v => Number(v).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const d3 = v => Math.round(v * 1000) / 1000;
+  const d3 = v => Math.round(v * 10000) / 10000;
   const CATRU = { deal: 'Производство', plakhov: 'Авторские', teaching: 'Курс', orgwork: 'Орг', absence: 'Отсутствие' };
   try {
     const det = await pgPool.query(
@@ -3537,7 +3661,7 @@ app.get('/socrates/salary', async (req, res) => {
     const rnd = n => Math.round(n).toLocaleString('ru-RU');
     const CATRU = { deal: 'Производство', plakhov: 'Авторские', teaching: 'Курс', orgwork: 'Орг', absence: 'Отсутствие' };
     const money = v => Number(v).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const d3 = v => Math.round(v * 1000) / 1000;
+    const d3 = v => Math.round(v * 10000) / 10000;
     let total = 0;
     let rows = '';
     let detBlocks = '';
@@ -3638,7 +3762,7 @@ app.get('/socrates/salary', async (req, res) => {
       '.ddet[open] summary::before{content:"▾ "}.dh{color:#A8853B;font-weight:600}' +
       '.dt .ab td{color:#9a6700;background:#FDF9F0}.warn{color:#b00}' +
       '</style></head><body>' +
-      '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + wdNote + '</div></div></div>' +
+      '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + wdNote + socAuditBadge() + '</div></div></div>' +
       '<div class="wrap">' +
       '<table><tr><th>Мастер</th><th style="text-align:right">Оклад</th><th style="text-align:right">Произв. дн</th><th style="text-align:right">Курс дн (оплата)</th><th style="text-align:right">За дни, руб</th><th style="text-align:right">Надбавка</th><th style="text-align:right">К выплате, руб</th></tr>' +
       rows +
@@ -3883,6 +4007,48 @@ app.get('/socrates/reparse', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String((e && e.message) || e) }); }
 });
 
+// автосверка: по дням пн-пт сравнивает заявленные часы (якорь «рабочий день N» или сумма «N час»)
+// с записанными в work_log; пачки без даты и сводки пропускает (их закрывает ручной аудит)
+async function socWeeklyAudit() {
+  const out = { week_of: null, checked: 0, issues: [] };
+  if (!pgPool) return out;
+  const now = new Date(Date.now() + 3*3600000);
+  const dow = (now.getUTCDay() + 6) % 7; // 0=пн
+  const mon = new Date(now); mon.setUTCDate(now.getUTCDate() - dow);
+  const days = []; for (let i = 0; i < 5; i++) { const d = new Date(mon); d.setUTCDate(mon.getUTCDate() + i); days.push(d.toISOString().slice(0, 10)); }
+  out.week_of = days[0];
+  const rep = await pgPool.query("SELECT author_name, text, msg_date FROM tg_reports WHERE msg_date >= EXTRACT(EPOCH FROM ($1||' 00:00:00+03')::timestamptz) AND msg_date < EXTRACT(EPOCH FROM ($2||' 23:59:59+03')::timestamptz)", [days[0], days[4]]);
+  const wl = await pgPool.query("SELECT master, work_date, category, day_fraction FROM work_log WHERE work_date >= $1 AND work_date <= $2", [days[0], days[4]]);
+  const writ = {};
+  for (const x of wl.rows) { if (x.category === 'absence') continue; const k = x.master + '|' + socIsoDate(x.work_date); writ[k] = (writ[k] || 0) + Number(x.day_fraction || 0) * 8; }
+  const stated = {};
+  for (const r of rep.rows) {
+    const t = String(r.text || ''); if (!t) continue;
+    if (/^\s*(пн|вт|ср|чт|пт|сб|вс)\s*[:.]/i.test(t)) continue; // пачки задним числом — вне авто
+    let name = null; const low = String(r.author_name || '').toLowerCase();
+    for (const [nm, info] of Object.entries(SOCRATES_MASTER_MAP)) if (info.aliases.some(al => low.indexOf(al) !== -1)) { name = nm; break; }
+    if (!name) continue;
+    const dm = t.match(/^\s*(\d{1,2})\s*\.\s*(\d{1,2})/);
+    const msgDay = new Date((Number(r.msg_date) + 3*3600) * 1000).toISOString().slice(0, 10);
+    let day = msgDay;
+    if (dm) { const dd = ('0' + dm[1]).slice(-2), mm = ('0' + dm[2]).slice(-2); const cand = msgDay.slice(0, 5) + mm + '-' + dd; if (days.indexOf(cand) !== -1) day = cand; }
+    if (days.indexOf(day) === -1) continue;
+    const tl = t.toLowerCase().replace(/,/g, '.');
+    let h = null; const anc = tl.match(/рабоч\w*\s*день\s*(\d+(?:\.\d+)?)/);
+    if (anc) h = parseFloat(anc[1]);
+    else { let s = 0; const mm2 = tl.match(/(\d+(?:\.\d+)?)\s*час/g) || []; for (const x of mm2) s += parseFloat(x); if (s > 0 && s <= 16) h = s; }
+    if (h === null) continue;
+    const k = name + '|' + day;
+    if (!(k in stated) || anc) stated[k] = h;
+  }
+  for (const [k, h] of Object.entries(stated)) {
+    out.checked++;
+    const w = Math.round((writ[k] || 0) * 100) / 100;
+    if (Math.abs(h - w) > 0.6) out.issues.push(k.replace('|', ' ') + ': заявлено ' + h + 'ч, записано ' + w + 'ч');
+  }
+  return out;
+}
+
 let socratesLastRun = null;
 if (process.env.SOCRATES_DIGEST === 'on') {
   setInterval(async function () {
@@ -3901,6 +4067,50 @@ if (process.env.SOCRATES_DIGEST === 'on') {
           console.log('⚠️ Сократ digest error:', digest.error);
         }
       } catch (e) { console.log('⚠️ Сократ scheduler:', e.message); }
+    }
+    // СТОРОЖ ВЕБХУКА: будний день, к 20:05 МСК в группе ни одного сообщения -> тревога Роману
+    if (h === 17 && m >= 5 && m < 10 && cache['soc_guard'] !== todayMsk) {
+      cache['soc_guard'] = todayMsk;
+      try {
+        const dow = new Date(Date.now() + 3*3600000).getUTCDay();
+        if (dow >= 1 && dow <= 5 && pgPool) {
+          const r = await pgPool.query("SELECT COUNT(*) c FROM tg_reports WHERE msg_date >= EXTRACT(EPOCH FROM ($1||' 00:00:00+03')::timestamptz)", [todayMsk]);
+          if (Number(r.rows[0].c) === 0 && socUsers['Роман']) {
+            await socSendDM(socUsers['Роман'], '⚠️ Тревога: сегодня (' + todayMsk + ') в группе отчётов НОЛЬ сообщений к 20:05. Возможно, упал вебхук — проверь ' + SOC_BASE_URL + '/health');
+          }
+        }
+      } catch (e) { console.log('guard:', e.message); }
+    }
+    // ПЯТНИЧНАЯ АВТОСВЕРКА 19:00 МСК: слова мастеров vs записанное за пн-пт
+    if (h === 16 && m < 5 && cache['soc_week_sent'] !== todayMsk) {
+      const dw = new Date(Date.now() + 3*3600000).getUTCDay();
+      if (dw === 5) {
+        cache['soc_week_sent'] = todayMsk;
+        try {
+          const a = await socWeeklyAudit();
+          cache['soc_week_audit'] = a; try { setCache('soc_week_audit', a); } catch (e) {}
+          if (socUsers['Роман']) {
+            const head = a.issues.length ? ('⚠️ Автосверка недели: ' + a.issues.length + ' расхождений:' ) : '✅ Автосверка недели: расхождений нет (' + a.checked + ' дней проверено).';
+            await socSendDM(socUsers['Роман'], head + (a.issues.length ? String.fromCharCode(10) + a.issues.slice(0, 12).join(String.fromCharCode(10)) : ''));
+          }
+        } catch (e) { console.log('week audit:', e.message); }
+      }
+    }
+    // 1-е ЧИСЛО 10:00 МСК: ссылки на ЗП за закрытый месяц — Роману общий, мастерам персональные
+    if (h === 7 && m < 5) {
+      const d = new Date(Date.now() + 3*3600000);
+      if (d.getUTCDate() === 1 && cache['soc_pay_sent'] !== todayMsk) {
+        cache['soc_pay_sent'] = todayMsk;
+        const pm = socPrevMonth();
+        try {
+          if (socUsers['Роман']) await socSendDM(socUsers['Роман'], 'Закрыт месяц ' + pm + '. Полный отчёт по ЗП:' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + pm + '&key=' + (process.env.PHOTO_KEY || ''));
+          for (const [nm, uid] of Object.entries(socUsers)) {
+            if (nm === 'Роман') continue;
+            await socSendDM(uid, 'Ваш расчёт за ' + pm + ':' + String.fromCharCode(10) + socMySalaryLink(nm, pm));
+            await new Promise(r => setTimeout(r, 300));
+          }
+        } catch (e) { console.log('pay links:', e.message); }
+      }
     }
   }, 60 * 1000);
   console.log('🕗 Сократ-планировщик ON (разбор в 22:00 МСК)');
@@ -4011,6 +4221,7 @@ app.listen(PORT, async () => {
     await initWorkLogTable();
     await pgLoadAllIntoMemory(cache);
     console.log('✓ Postgres кэш загружен в память');
+    await socLoadUsers();
   } else {
     console.log('ℹ️ Postgres выключен — работаем в памяти (кэш очистится при перезапуске)');
   }
