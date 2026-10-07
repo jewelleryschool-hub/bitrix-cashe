@@ -3382,6 +3382,7 @@ function socWorkdays(month){ // рабочих дней в YYYY-MM по прои
 }
 app.get('/socrates/report', async (req, res) => {
   res.set('Content-Type','text/html; charset=utf-8');
+  res.set('Cache-Control','no-store');
   if (!pgPool) return res.send('Postgres отключён');
   const month = /^\d{4}-\d{2}$/.test(req.query.month||'') ? req.query.month : new Date(Date.now()+3*3600000).toISOString().slice(0,7);
   const [__ry, __rm] = month.split('-').map(Number);
@@ -3549,6 +3550,7 @@ const SOC_TEACH_K = 1.45;
 // токен = sha256(PHOTO_KEY + '|' + имя).slice(0,10) — общий ключ наружу не уходит
 app.get('/socrates/my-salary', async (req, res) => {
   res.set('Content-Type', 'text/html; charset=utf-8');
+  res.set('Cache-Control','no-store');
   if (!pgPool) return res.send('Postgres отключён');
   const m = String(req.query.m || '');
   const tok = require('crypto').createHash('sha256').update((process.env.PHOTO_KEY || '') + '|' + m).digest('hex').slice(0, 10);
@@ -3621,6 +3623,7 @@ app.get('/socrates/my-salary', async (req, res) => {
 
 app.get('/socrates/salary', async (req, res) => {
   res.set('Content-Type', 'text/html; charset=utf-8');
+  res.set('Cache-Control','no-store');
   if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).send('Доступ по ключу: ?key=...');
   if (!pgPool) return res.send('Postgres отключён');
   const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 7);
