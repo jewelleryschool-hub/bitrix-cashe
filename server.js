@@ -2453,6 +2453,19 @@ async function socSendDM(userId, text) {
   } catch (e) { return { ok: false, error: String(e.message || e) }; }
 }
 // токен ПРОСМОТРА отчётов: производный от PHOTO_KEY, сам ключ не раскрывает и прав на запись не даёт
+// листалка месяцев (только общая страница ЗП)
+function socMonthNav(month, authQS) {
+  const [y, m] = month.split('-').map(Number);
+  const prev = new Date(Date.UTC(y, m - 2, 1)).toISOString().slice(0, 7);
+  const next = new Date(Date.UTC(y, m, 1)).toISOString().slice(0, 7);
+  const cur = new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 7);
+  const mk = function (mm, label) { return '<a style="color:#C9A961;text-decoration:none;border:1px solid rgba(201,169,97,.45);border-radius:7px;padding:4px 12px;white-space:nowrap" href="/socrates/salary?month=' + mm + '&' + authQS + '">' + label + '</a>'; };
+  return '<div style="display:flex;gap:10px;align-items:center;margin-top:12px;font-size:13px;flex-wrap:wrap">' +
+    mk(prev, '← ' + prev) +
+    (next <= cur ? mk(next, next + ' →') : '') +
+    (month !== cur ? mk(cur, 'текущий месяц') : '') +
+    '</div>';
+}
 function socViewToken() {
   return require('crypto').createHash('sha256').update((process.env.PHOTO_KEY || '') + '|view-reports').digest('hex').slice(0, 12);
 }
@@ -3718,31 +3731,50 @@ app.get('/socrates/salary', async (req, res) => {
         '<table class="dt flat"><tr><th>Дата</th><th>Что делал (цитата из отчёта)</th><th style="text-align:right">Расчёт</th><th style="text-align:right">Сумма, ₽</th></tr>' + lines +
         '<tr class="msum"><td></td><td>ИТОГО' + (bonus ? ' (вкл. надбавку ' + rnd(bonus) + ')' : '') + '</td><td></td><td class="n pay">' + money(pay) + '</td></tr></table></details>';
     }
-    // себестоимость сделок по ЗП мастеров: Σ(доля × дневная ставка мастера)
-    const rateOf = {};
-    for (const mm of Object.keys(salary)) rateOf[mm] = salary[mm][0] / wd;
-    const cost = {};
+    // СЕБЕСТОИМОСТЬ НАКОПИТЕЛЬНО: по каждой сделке месяца — все её затраты за всю историю,
+    // помесячно; ставка каждого месяца = оклад / рабочие дни ТОГО месяца (произв. календарь)
+    const monthObjs = [];
     for (const x of det.rows) {
-      if (x.category !== 'deal' && x.category !== 'plakhov') continue;
-      const f = x.day_fraction === null ? 0 : Number(x.day_fraction);
-      const rt = rateOf[x.master] || 0;
-      const o = x.object || '(без объекта)';
-      if (!cost[o]) cost[o] = { rub: 0, hours: 0, who: {} };
-      cost[o].rub += f * rt;
-      cost[o].hours += f * 8;
-      cost[o].who[x.master] = (cost[o].who[x.master] || 0) + f * rt;
+      if ((x.category === 'deal' || x.category === 'plakhov') && x.object && monthObjs.indexOf(x.object) === -1) monthObjs.push(x.object);
     }
-    let costTotal = 0;
+    const cost = {};
+    let costCur = 0, costAll = 0;
+    if (monthObjs.length) {
+      const allq = await pgPool.query(
+        `SELECT object, master, to_char(work_date,'YYYY-MM') AS mth, SUM(COALESCE(day_fraction,0)) AS d
+         FROM work_log
+         WHERE object = ANY($1) AND category IN ('deal','plakhov') AND work_date <= $2
+         GROUP BY object, master, mth`, [monthObjs, to]);
+      const rateAt = function (mm, mth) { return salary[mm] ? salary[mm][0] / socWorkdays(mth) : 0; };
+      for (const r of allq.rows) {
+        const o = r.object, f = Number(r.d), rub = f * rateAt(r.master, r.mth);
+        if (!cost[o]) cost[o] = { rub: 0, hours: 0, who: {}, byMonth: {} };
+        cost[o].rub += rub; cost[o].hours += f * 8;
+        cost[o].who[r.master] = (cost[o].who[r.master] || 0) + rub;
+        if (!cost[o].byMonth[r.mth]) cost[o].byMonth[r.mth] = { rub: 0, hours: 0 };
+        cost[o].byMonth[r.mth].rub += rub; cost[o].byMonth[r.mth].hours += f * 8;
+      }
+    }
     const costRows = Object.keys(cost).sort((a,b)=>cost[b].rub-cost[a].rub).map(o=>{
-      const c = cost[o]; costTotal += c.rub;
+      const c = cost[o]; costAll += c.rub;
+      const curM = c.byMonth[month] || { rub: 0, hours: 0 }; costCur += curM.rub;
       const who = Object.entries(c.who).sort((a,b)=>b[1]-a[1]).map(([n,v])=>socEsc(n.split(' ')[0])+' '+money(v)).join(', ');
-      return '<tr><td class="nm">'+socEsc(o)+'</td><td class="n">'+(Math.round(c.hours*10)/10)+' ч</td><td class="n pay">'+money(c.rub)+'</td><td class="mut" style="font-size:11.5px">'+who+'</td></tr>';
+      const chips = Object.keys(c.byMonth).sort().map(mt=>{
+        const b = c.byMonth[mt]; const hot = mt === month;
+        return '<span style="display:inline-block;margin:2px 6px 2px 0;padding:2px 8px;border-radius:6px;font-size:11px;'+
+          (hot ? 'background:#A8853B;color:#fff;font-weight:600' : 'background:#EFECE5;color:#6E6A63')+'">'+
+          mt.slice(2)+': '+(Math.round(b.hours*10)/10)+'ч · '+money(b.rub)+'</span>';
+      }).join('');
+      return '<tr><td class="nm">'+socEsc(o)+'</td><td class="n">'+(Math.round(c.hours*10)/10)+' ч</td><td class="n pay">'+money(c.rub)+'</td><td class="mut" style="font-size:11.5px">'+who+'</td></tr>'+
+        '<tr><td colspan="4" style="padding:2px 10px 10px;border-top:none">'+chips+'</td></tr>';
     }).join('');
-    const costBlock = '<h2 style="font-family:Georgia,serif;font-size:19px;margin:28px 0 10px">Себестоимость сделок (по ЗП мастеров)</h2>'+
-      '<table><tr><th>Сделка / изделие</th><th style="text-align:right">Часы</th><th style="text-align:right">Себестоимость, ₽</th><th>Разбивка по мастерам</th></tr>'+
+    const costBlock = '<h2 style="font-family:Georgia,serif;font-size:19px;margin:28px 0 10px">Себестоимость сделок — накопительно</h2>'+
+      '<div class="mut" style="margin:-4px 0 10px;font-size:12px">Все сделки, по которым шла работа в '+socEsc(SOC_MONTHS[sm-1])+'. Сумма — за всю историю работ; золотой чип — вклад текущего месяца, серые — прошлые месяцы.</div>'+
+      '<table><tr><th>Сделка / изделие</th><th style="text-align:right">Часы всего</th><th style="text-align:right">Себестоимость всего, ₽</th><th>Разбивка по мастерам (вся история)</th></tr>'+
       costRows+
-      '<tr class="tot"><td>ИТОГО производство</td><td></td><td class="n">'+money(costTotal)+'</td><td></td></tr></table>'+
-      '<div class="mut" style="margin-top:6px;font-size:11.5px">Себестоимость = доли дней мастеров по сделке × их дневные ставки (оклад / '+wd+'). Курс и оргработа в себестоимость сделок не входят.</div>';
+      '<tr class="tot"><td>ИТОГО: вклад '+socEsc(SOC_MONTHS[sm-1])+'</td><td></td><td class="n">'+money(costCur)+'</td><td></td></tr>'+
+      '<tr class="tot"><td>ИТОГО накопительно по этим сделкам</td><td></td><td class="n">'+money(costAll)+'</td><td></td></tr></table>'+
+      '<div class="mut" style="margin-top:6px;font-size:11.5px">Ставка каждого месяца = оклад / рабочие дни того месяца по производственному календарю. Курс и оргработа в себестоимость не входят.</div>';
     const title = SOC_MONTHS[sm - 1] + ' ' + sy;
     res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
       '<title>Расчёт ЗП · ' + socEsc(title) + '</title><style>' +
@@ -3771,7 +3803,8 @@ app.get('/socrates/salary', async (req, res) => {
       '.ddet[open] summary::before{content:"▾ "}.dh{color:#A8853B;font-weight:600}' +
       '.dt .ab td{color:#9a6700;background:#FDF9F0}.warn{color:#b00}' +
       '</style></head><body>' +
-      '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + wdNote + socAuditBadge() + '</div></div></div>' +
+      '<div class="hero"><div class="wrap"><h1>Расчёт заработной платы мастерской</h1><div class="sub">' + socEsc(title) + ' · рабочих дней: ' + wd + wdNote + socAuditBadge() + '</div>' +
+      socMonthNav(month, (req.query.v ? ('v=' + encodeURIComponent(req.query.v)) : ('key=' + encodeURIComponent(req.query.key || '')))) + '</div></div>' +
       '<div class="wrap">' +
       '<table><tr><th>Мастер</th><th style="text-align:right">Оклад</th><th style="text-align:right">Произв. дн</th><th style="text-align:right">Курс дн (оплата)</th><th style="text-align:right">За дни, руб</th><th style="text-align:right">Надбавка</th><th style="text-align:right">К выплате, руб</th></tr>' +
       rows +
