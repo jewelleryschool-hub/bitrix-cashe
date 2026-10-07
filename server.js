@@ -2452,6 +2452,10 @@ async function socSendDM(userId, text) {
     return { ok: !!j.ok, error: j.ok ? null : (j.description || 'send failed') };
   } catch (e) { return { ok: false, error: String(e.message || e) }; }
 }
+// токен ПРОСМОТРА отчётов: производный от PHOTO_KEY, сам ключ не раскрывает и прав на запись не даёт
+function socViewToken() {
+  return require('crypto').createHash('sha256').update((process.env.PHOTO_KEY || '') + '|view-reports').digest('hex').slice(0, 12);
+}
 function socMySalaryLink(name, month) {
   const t = require('crypto').createHash('sha256').update((process.env.PHOTO_KEY || '') + '|' + name).digest('hex').slice(0, 10);
   return SOC_BASE_URL + '/socrates/my-salary?month=' + month + '&m=' + encodeURIComponent(name) + '&t=' + t;
@@ -2480,7 +2484,7 @@ app.get('/socrates/dm', async (req, res) => {
     if (!uid) { results.push({ to: nm, ok: false, error: 'не нажал Start' }); return; }
     const text = req.query.text ? String(req.query.text)
       : (nm === 'Роман'
-        ? ('Отчёт по ЗП за ' + month + ':' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + month + '&key=' + (process.env.PHOTO_KEY || ''))
+        ? ('Отчёт по ЗП за ' + month + ':' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + month + '&v=' + socViewToken())
         : ('Ваш расчёт за ' + month + ':' + String.fromCharCode(10) + socMySalaryLink(nm, month)));
     const r = await socSendDM(uid, text);
     results.push({ to: nm, ok: r.ok, error: r.error });
@@ -2532,7 +2536,7 @@ app.post('/socrates/tg', async (req, res) => {
         if (canon && pgPool) {
           try { await pgPool.query('INSERT INTO socrates_users(name,user_id) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET user_id=EXCLUDED.user_id', [canon, uid]); socUsers[canon] = uid; } catch (e) { console.log('users upsert:', e.message); }
           if (canon === 'Роман') {
-            await socSendDM(uid, 'Личный канал подключён. Здесь будут: ссылки на отчёты по ЗП, тревоги вебхука и еженедельная сверка.' + String.fromCharCode(10) + String.fromCharCode(10) + 'Отчёт по зарплате за ' + socPrevMonth() + ':' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + socPrevMonth() + '&key=' + (process.env.PHOTO_KEY || ''));
+            await socSendDM(uid, 'Личный канал подключён. Здесь будут: ссылки на отчёты по ЗП, тревоги вебхука и еженедельная сверка.' + String.fromCharCode(10) + String.fromCharCode(10) + 'Отчёт по зарплате за ' + socPrevMonth() + ':' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + socPrevMonth() + '&v=' + socViewToken());
           } else {
             await socSendDM(uid, 'Личный канал подключён, ' + (SOCRATES_MASTER_MAP[canon].call) + '. Ваш персональный расчёт за ' + socPrevMonth() + ':' + String.fromCharCode(10) + socMySalaryLink(canon, socPrevMonth()) + String.fromCharCode(10) + 'Чужие данные по этой ссылке не видны.');
           }
@@ -2567,7 +2571,7 @@ app.post('/socrates/tg', async (req, res) => {
       }
       if (/зарплат|salary|расч[её]т/i.test(txt) && canon) {
         const mth = socCurMonth();
-        const link = canon === 'Роман' ? (SOC_BASE_URL + '/socrates/salary?month=' + mth + '&key=' + (process.env.PHOTO_KEY || '')) : socMySalaryLink(canon, mth);
+        const link = canon === 'Роман' ? (SOC_BASE_URL + '/socrates/salary?month=' + mth + '&v=' + socViewToken()) : socMySalaryLink(canon, mth);
         await socSendDM(uid, 'Расчёт за ' + mth + ':' + String.fromCharCode(10) + link);
         return;
       }
@@ -3383,6 +3387,7 @@ function socWorkdays(month){ // рабочих дней в YYYY-MM по прои
 app.get('/socrates/report', async (req, res) => {
   res.set('Content-Type','text/html; charset=utf-8');
   res.set('Cache-Control','no-store');
+  if (process.env.PHOTO_KEY && req.query.v && req.query.v !== socViewToken() && req.query.key !== process.env.PHOTO_KEY) return res.status(403).send('неверный токен');
   if (!pgPool) return res.send('Postgres отключён');
   const month = /^\d{4}-\d{2}$/.test(req.query.month||'') ? req.query.month : new Date(Date.now()+3*3600000).toISOString().slice(0,7);
   const [__ry, __rm] = month.split('-').map(Number);
@@ -3624,7 +3629,8 @@ app.get('/socrates/my-salary', async (req, res) => {
 app.get('/socrates/salary', async (req, res) => {
   res.set('Content-Type', 'text/html; charset=utf-8');
   res.set('Cache-Control','no-store');
-  if (!process.env.PHOTO_KEY || req.query.key !== process.env.PHOTO_KEY) return res.status(403).send('Доступ по ключу: ?key=...');
+  const okAuth = process.env.PHOTO_KEY && (req.query.key === process.env.PHOTO_KEY || req.query.v === socViewToken());
+  if (!okAuth) return res.status(403).send('Доступ по ссылке с токеном (?v=...) или ключом.');
   if (!pgPool) return res.send('Postgres отключён');
   const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : new Date(Date.now() + 3 * 3600000).toISOString().slice(0, 7);
   const [sy, sm] = month.split('-').map(Number);
@@ -4106,7 +4112,7 @@ if (process.env.SOCRATES_DIGEST === 'on') {
         cache['soc_pay_sent'] = todayMsk;
         const pm = socPrevMonth();
         try {
-          if (socUsers['Роман']) await socSendDM(socUsers['Роман'], 'Закрыт месяц ' + pm + '. Полный отчёт по ЗП:' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + pm + '&key=' + (process.env.PHOTO_KEY || ''));
+          if (socUsers['Роман']) await socSendDM(socUsers['Роман'], 'Закрыт месяц ' + pm + '. Полный отчёт по ЗП:' + String.fromCharCode(10) + SOC_BASE_URL + '/socrates/salary?month=' + pm + '&v=' + socViewToken());
           for (const [nm, uid] of Object.entries(socUsers)) {
             if (nm === 'Роман') continue;
             await socSendDM(uid, 'Ваш расчёт за ' + pm + ':' + String.fromCharCode(10) + socMySalaryLink(nm, pm));
