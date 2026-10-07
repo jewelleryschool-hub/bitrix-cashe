@@ -3731,50 +3731,41 @@ app.get('/socrates/salary', async (req, res) => {
         '<table class="dt flat"><tr><th>Дата</th><th>Что делал (цитата из отчёта)</th><th style="text-align:right">Расчёт</th><th style="text-align:right">Сумма, ₽</th></tr>' + lines +
         '<tr class="msum"><td></td><td>ИТОГО' + (bonus ? ' (вкл. надбавку ' + rnd(bonus) + ')' : '') + '</td><td></td><td class="n pay">' + money(pay) + '</td></tr></table></details>';
     }
-    // СЕБЕСТОИМОСТЬ НАКОПИТЕЛЬНО: по каждой сделке месяца — все её затраты за всю историю,
-    // помесячно; ставка каждого месяца = оклад / рабочие дни ТОГО месяца (произв. календарь)
-    const monthObjs = [];
-    for (const x of det.rows) {
-      if ((x.category === 'deal' || x.category === 'plakhov') && x.object && monthObjs.indexOf(x.object) === -1) monthObjs.push(x.object);
-    }
+    // СЕБЕСТОИМОСТЬ: ВСЕ сделки/изделия с начала года, помесячно + сумма
+    const yearFrom = month.slice(0, 4) + '-01-01';
+    const allq = await pgPool.query(
+      `SELECT object, master, to_char(work_date,'YYYY-MM') AS mth, SUM(COALESCE(day_fraction,0)) AS d
+       FROM work_log
+       WHERE work_date >= $1 AND work_date <= $2 AND category IN ('deal','plakhov') AND object IS NOT NULL
+       GROUP BY object, master, mth`, [yearFrom, to]);
+    const rateAt = function (mm, mth) { return salary[mm] ? salary[mm][0] / socWorkdays(mth) : 0; };
     const cost = {};
     let costCur = 0, costAll = 0;
-    if (monthObjs.length) {
-      const allq = await pgPool.query(
-        `SELECT object, master, to_char(work_date,'YYYY-MM') AS mth, SUM(COALESCE(day_fraction,0)) AS d
-         FROM work_log
-         WHERE object = ANY($1) AND category IN ('deal','plakhov') AND work_date <= $2
-         GROUP BY object, master, mth`, [monthObjs, to]);
-      const rateAt = function (mm, mth) { return salary[mm] ? salary[mm][0] / socWorkdays(mth) : 0; };
-      for (const r of allq.rows) {
-        const o = r.object, f = Number(r.d), rub = f * rateAt(r.master, r.mth);
-        if (!cost[o]) cost[o] = { rub: 0, hours: 0, who: {}, byMonth: {} };
-        cost[o].rub += rub; cost[o].hours += f * 8;
-        cost[o].who[r.master] = (cost[o].who[r.master] || 0) + rub;
-        if (!cost[o].byMonth[r.mth]) cost[o].byMonth[r.mth] = { rub: 0, hours: 0 };
-        cost[o].byMonth[r.mth].rub += rub; cost[o].byMonth[r.mth].hours += f * 8;
-      }
+    for (const r of allq.rows) {
+      const o = r.object, f = Number(r.d), rub = f * rateAt(r.master, r.mth);
+      if (!cost[o]) cost[o] = { rub: 0, byMonth: {} };
+      cost[o].rub += rub;
+      if (!cost[o].byMonth[r.mth]) cost[o].byMonth[r.mth] = { rub: 0, hours: 0 };
+      cost[o].byMonth[r.mth].rub += rub; cost[o].byMonth[r.mth].hours += f * 8;
     }
     const costRows = Object.keys(cost).sort((a,b)=>cost[b].rub-cost[a].rub).map(o=>{
-      const c = cost[o]; costAll += c.rub;
-      const curM = c.byMonth[month] || { rub: 0, hours: 0 }; costCur += curM.rub;
-      const who = Object.entries(c.who).sort((a,b)=>b[1]-a[1]).map(([n,v])=>socEsc(n.split(' ')[0])+' '+money(v)).join(', ');
+      const c = cost[o];
+      costAll += c.rub;
+      if (c.byMonth[month]) costCur += c.byMonth[month].rub;
       const chips = Object.keys(c.byMonth).sort().map(mt=>{
         const b = c.byMonth[mt]; const hot = mt === month;
         return '<span style="display:inline-block;margin:2px 6px 2px 0;padding:2px 8px;border-radius:6px;font-size:11px;'+
           (hot ? 'background:#A8853B;color:#fff;font-weight:600' : 'background:#EFECE5;color:#6E6A63')+'">'+
           mt.slice(2)+': '+(Math.round(b.hours*10)/10)+'ч · '+money(b.rub)+'</span>';
       }).join('');
-      return '<tr><td class="nm">'+socEsc(o)+'</td><td class="n">'+(Math.round(c.hours*10)/10)+' ч</td><td class="n pay">'+money(c.rub)+'</td><td class="mut" style="font-size:11.5px">'+who+'</td></tr>'+
-        '<tr><td colspan="4" style="padding:2px 10px 10px;border-top:none">'+chips+'</td></tr>';
+      return '<tr><td class="nm" style="white-space:nowrap">'+socEsc(o)+'</td><td>'+chips+'</td><td class="n pay" style="vertical-align:top">'+money(c.rub)+'</td></tr>';
     }).join('');
-    const costBlock = '<h2 style="font-family:Georgia,serif;font-size:19px;margin:28px 0 10px">Себестоимость сделок — накопительно</h2>'+
-      '<div class="mut" style="margin:-4px 0 10px;font-size:12px">Все сделки, по которым шла работа в '+socEsc(SOC_MONTHS[sm-1])+'. Сумма — за всю историю работ; золотой чип — вклад текущего месяца, серые — прошлые месяцы.</div>'+
-      '<table><tr><th>Сделка / изделие</th><th style="text-align:right">Часы всего</th><th style="text-align:right">Себестоимость всего, ₽</th><th>Разбивка по мастерам (вся история)</th></tr>'+
+    const costBlock = '<h2 style="font-family:Georgia,serif;font-size:19px;margin:28px 0 10px">Себестоимость сделок и изделий — с начала года</h2>'+
+      '<table><tr><th>Сделка / изделие</th><th>По месяцам (часы · ₽)</th><th style="text-align:right">Сумма, ₽</th></tr>'+
       costRows+
-      '<tr class="tot"><td>ИТОГО: вклад '+socEsc(SOC_MONTHS[sm-1])+'</td><td></td><td class="n">'+money(costCur)+'</td><td></td></tr>'+
-      '<tr class="tot"><td>ИТОГО накопительно по этим сделкам</td><td></td><td class="n">'+money(costAll)+'</td><td></td></tr></table>'+
-      '<div class="mut" style="margin-top:6px;font-size:11.5px">Ставка каждого месяца = оклад / рабочие дни того месяца по производственному календарю. Курс и оргработа в себестоимость не входят.</div>';
+      '<tr class="tot"><td>ИТОГО: вклад '+socEsc(SOC_MONTHS[sm-1])+'</td><td></td><td class="n">'+money(costCur)+'</td></tr>'+
+      '<tr class="tot"><td>ИТОГО с начала года</td><td></td><td class="n">'+money(costAll)+'</td></tr></table>'+
+      '<div class="mut" style="margin-top:6px;font-size:11.5px">Золотой чип — текущий месяц. Ставка каждого месяца = оклад / рабочие дни того месяца (произв. календарь). Курс и оргработа не входят.</div>';
     const title = SOC_MONTHS[sm - 1] + ' ' + sy;
     res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
       '<title>Расчёт ЗП · ' + socEsc(title) + '</title><style>' +
