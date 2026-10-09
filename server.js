@@ -3734,7 +3734,7 @@ app.get('/socrates/salary', async (req, res) => {
     // СЕБЕСТОИМОСТЬ: ВСЕ сделки/изделия с начала года, помесячно + сумма
     const yearFrom = month.slice(0, 4) + '-01-01';
     const allq = await pgPool.query(
-      `SELECT object, master, to_char(work_date,'YYYY-MM') AS mth, SUM(COALESCE(day_fraction,0)) AS d
+      `SELECT object, master, operation, to_char(work_date,'YYYY-MM') AS mth, SUM(COALESCE(day_fraction,0)) AS d
        FROM work_log
        WHERE work_date >= $1 AND work_date <= $2 AND category IN ('deal','plakhov') AND object IS NOT NULL
        GROUP BY object, master, mth, operation`, [yearFrom, to]);
