@@ -3737,16 +3737,26 @@ app.get('/socrates/salary', async (req, res) => {
       `SELECT object, master, to_char(work_date,'YYYY-MM') AS mth, SUM(COALESCE(day_fraction,0)) AS d
        FROM work_log
        WHERE work_date >= $1 AND work_date <= $2 AND category IN ('deal','plakhov') AND object IS NOT NULL
-       GROUP BY object, master, mth`, [yearFrom, to]);
+       GROUP BY object, master, mth, operation`, [yearFrom, to]);
+    // нормализация операции к виду работ
+    const opKind = function (op) {
+      const t = String(op || '').toLowerCase();
+      const map = [['закреп','закрепка'],['монтиров','монтировка'],['раздел','разделка'],['полиров','полировка'],['шлифов','шлифовка'],['гравиров','гравировка'],['всечк','всечка'],['эскиз','эскизы'],['рисун','эскизы'],['свар','сварка'],['травлен','травление'],['варка','варка'],['сборк','сборка'],['финиш','финиш'],['ремонт','ремонт'],['обработ','обработка'],['навар','навар'],['сухар','механика'],['лайнер','механика'],['замок','механика']];
+      for (const [k, v] of map) if (t.indexOf(k) !== -1) return v;
+      return 'прочее';
+    };
     const rateAt = function (mm, mth) { return salary[mm] ? salary[mm][0] / socWorkdays(mth) : 0; };
     const cost = {};
     let costCur = 0, costAll = 0;
     for (const r of allq.rows) {
       const o = r.object, f = Number(r.d), rub = f * rateAt(r.master, r.mth);
-      if (!cost[o]) cost[o] = { rub: 0, byMonth: {} };
+      if (!cost[o]) cost[o] = { rub: 0, byMonth: {}, byKind: {} };
       cost[o].rub += rub;
       if (!cost[o].byMonth[r.mth]) cost[o].byMonth[r.mth] = { rub: 0, hours: 0 };
       cost[o].byMonth[r.mth].rub += rub; cost[o].byMonth[r.mth].hours += f * 8;
+      const kk = opKind(r.operation);
+      if (!cost[o].byKind[kk]) cost[o].byKind[kk] = { rub: 0, hours: 0 };
+      cost[o].byKind[kk].rub += rub; cost[o].byKind[kk].hours += f * 8;
     }
     const costRows = Object.keys(cost).sort((a,b)=>cost[b].rub-cost[a].rub).map(o=>{
       const c = cost[o];
@@ -3758,10 +3768,13 @@ app.get('/socrates/salary', async (req, res) => {
           (hot ? 'background:#A8853B;color:#fff;font-weight:600' : 'background:#EFECE5;color:#6E6A63')+'">'+
           mt.slice(2)+': '+(Math.round(b.hours*10)/10)+'ч · '+money(b.rub)+'</span>';
       }).join('');
-      return '<tr><td class="nm" style="white-space:nowrap">'+socEsc(o)+'</td><td>'+chips+'</td><td class="n pay" style="vertical-align:top">'+money(c.rub)+'</td></tr>';
+      const kinds = Object.entries(c.byKind).sort((a,b)=>b[1].rub-a[1].rub).map(([k,b])=>
+        '<span style="display:inline-block;margin:2px 6px 2px 0;padding:1px 8px;border-radius:6px;font-size:11px;border:1px solid #D8D2C4;background:#fff;color:#55504A">'+
+        socEsc(k)+' '+(Math.round(b.hours*10)/10)+'ч · '+money(b.rub)+'</span>').join('');
+      return '<tr><td class="nm" style="white-space:nowrap">'+socEsc(o)+'</td><td>'+chips+'<div style="margin-top:3px">'+kinds+'</div></td><td class="n pay" style="vertical-align:top">'+money(c.rub)+'</td></tr>';
     }).join('');
     const costBlock = '<h2 style="font-family:Georgia,serif;font-size:19px;margin:28px 0 10px">Себестоимость сделок и изделий — с начала года</h2>'+
-      '<table><tr><th>Сделка / изделие</th><th>По месяцам (часы · ₽)</th><th style="text-align:right">Сумма, ₽</th></tr>'+
+      '<table><tr><th>Сделка / изделие</th><th>По месяцам и видам работ (часы · ₽)</th><th style="text-align:right">Сумма, ₽</th></tr>'+
       costRows+
       '<tr class="tot"><td>ИТОГО: вклад '+socEsc(SOC_MONTHS[sm-1])+'</td><td></td><td class="n">'+money(costCur)+'</td></tr>'+
       '<tr class="tot"><td>ИТОГО с начала года</td><td></td><td class="n">'+money(costAll)+'</td></tr></table>'+
