@@ -3564,6 +3564,14 @@ const SOC_SALARY_DEFAULT = {
   'Олег Гиниборг': [120000, 0]
 };
 const SOC_TEACH_K = 1.45;
+// Творческие проекты Виктора — оклад 120 000/мес [решение Романа 05.11.2026]:
+// его дни на этих изделиях считаются по повышенной ставке (в ЗП и в себестоимости)
+const SOC_CREATIVE = { master: 'Витя Комисар', base: 120000, match: ['подсолнух', 'ирис', 'тюльпан', 'титан цвет'] };
+function socIsCreative(master, obj) {
+  if (master !== SOC_CREATIVE.master || !obj) return false;
+  const o = String(obj).toLowerCase();
+  return SOC_CREATIVE.match.some(w => o.indexOf(w) !== -1);
+}
 // персональный расчёт ЗП одного мастера: /socrates/my-salary?month=YYYY-MM&m=Имя&t=токен
 // токен = sha256(PHOTO_KEY + '|' + имя).slice(0,10) — общий ключ наружу не уходит
 app.get('/socrates/my-salary', async (req, res) => {
@@ -3590,21 +3598,22 @@ app.get('/socrates/my-salary', async (req, res) => {
       `SELECT work_date, category, object, operation, day_fraction, raw_text
        FROM work_log WHERE master = $1 AND work_date >= $2 AND work_date <= $3 AND category <> 'ignore'
        ORDER BY work_date, id`, [m, from, to]);
-    let prod = 0, teach = 0, absent = 0;
+    let prod = 0, teach = 0, absent = 0, cre = 0;
+    const rateCre = SOC_CREATIVE.base / wd;
     const lines = det.rows.map(x => {
       const dt = socIsoDate(x.work_date).slice(5).split('-').reverse().join('.');
       const f = x.day_fraction === null ? null : Number(x.day_fraction);
       const isT = x.category === 'teaching', isA = x.category === 'absence';
-      if (f !== null) { if (isA) absent += f; else if (isT) teach += f; else prod += f; }
+      if (f !== null) { if (isA) absent += f; else if (isT) teach += f; else if (socIsCreative(m, x.object)) cre += f; else prod += f; }
       const what = (x.object ? socEsc(x.object) + ' — ' : '') + socEsc(x.operation || (CATRU[x.category] || x.category));
       const quote = x.raw_text ? '<div class="qt">«' + socEsc(String(x.raw_text).replace(/\s+/g, ' ').slice(0, 90)) + '»</div>' : '';
       let calc = '', sum = '';
       if (isA) calc = '<span class="mut">не оплачивается</span>';
       else if (f === null) calc = '<span class="warn">доля не определена</span>';
-      else { const pay = f * rate * (isT ? SOC_TEACH_K : 1); calc = d3(f) + ' × ' + money(rate) + (isT ? ' × ' + SOC_TEACH_K : ''); sum = money(pay); }
+      else { const rr = socIsCreative(m, x.object) ? rateCre : rate; const pay = f * rr * (isT ? SOC_TEACH_K : 1); calc = d3(f) + ' × ' + money(rr) + (isT ? ' × ' + SOC_TEACH_K : ''); sum = money(pay); }
       return '<tr' + (isA ? ' class="ab"' : '') + '><td class="dtd">' + dt + '</td><td>' + what + quote + '</td><td class="n calc">' + calc + '</td><td class="n">' + sum + '</td></tr>';
     }).join('');
-    const pay = rate * prod + rate * SOC_TEACH_K * teach + ((prod + teach) > 0 ? bonus : 0);
+    const pay = rate * prod + rateCre * cre + rate * SOC_TEACH_K * teach + ((prod + teach + cre) > 0 ? bonus : 0);
     const title = SOC_MONTHS[sm - 1] + ' ' + sy;
     res.send('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
       '<title>ЗП · ' + socEsc(m) + ' · ' + title + '</title><style>' +
@@ -3627,6 +3636,7 @@ app.get('/socrates/my-salary', async (req, res) => {
       '<div class="formula">' +
       'Дневная ставка: ' + Math.round(base).toLocaleString('ru-RU') + ' / ' + wd + ' = <b>' + money(rate) + '</b> ₽/день<br>' +
       'Производственные дни: ' + d3(prod) + ' × ' + money(rate) + ' = <b>' + money(rate * prod) + '</b> ₽' +
+      (cre ? '<br>Творческие проекты (Подсолнух/Ирис/Тюльпан): ' + d3(cre) + ' × ' + money(rateCre) + ' = <b>' + money(rateCre * cre) + '</b> ₽' : '') +
       (teach ? '<br>Дни курса: ' + d3(teach) + ' × ' + money(rate) + ' × ' + SOC_TEACH_K + ' = <b>' + money(rate * SOC_TEACH_K * teach) + '</b> ₽' : '') +
       (absent ? '<br>Отсутствия (не оплачиваются): ' + d3(absent) + ' дн' : '') +
       (bonus ? '<br>Надбавка: <b>' + Math.round(bonus).toLocaleString('ru-RU') + '</b> ₽' : '') +
@@ -3667,10 +3677,11 @@ app.get('/socrates/salary', async (req, res) => {
       `SELECT work_date, master, category, object, operation, day_fraction, raw_text
        FROM work_log WHERE work_date >= $1 AND work_date <= $2 AND category <> 'ignore'
        ORDER BY master, work_date, id`, [from, to]);
-    const detBy = {};
+    const detBy = {}; const creBy = {};
     for (const x of det.rows) {
       if (!detBy[x.master]) detBy[x.master] = [];
       detBy[x.master].push(x);
+      if (x.category !== 'absence' && x.day_fraction !== null && socIsCreative(x.master, x.object)) creBy[x.master] = (creBy[x.master] || 0) + Number(x.day_fraction);
     }
     const agg = {};
     for (const x of r.rows) {
@@ -3692,15 +3703,18 @@ app.get('/socrates/salary', async (req, res) => {
       const a = agg[m] || { total: 0, teach: 0, absent: 0 };
       const worked = a.total - a.absent;
       const teach = a.teach;
-      const prod = worked - teach;
+      const cre = creBy[m] || 0;
+      const prod = worked - teach - cre;
+      const rateCre = SOC_CREATIVE.base / wd;
+      const crePay = rateCre * cre;
       const rate = base / wd;
       const prodPay = rate * prod;
       const teachPay = rate * SOC_TEACH_K * teach;
-      const pay = prodPay + teachPay + (worked > 0 ? bonus : 0);
+      const pay = prodPay + crePay + teachPay + (worked > 0 ? bonus : 0);
       total += pay;
       const bonusCell = bonus ? '+' + rnd(bonus) : '';
       const teachCell = teach ? d3(teach) + ' <span class="mut">(' + money(teachPay) + ')</span>' : '';
-      rows += '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + d3(prod) + '</td><td class="n">' + teachCell + '</td><td class="n">' + money(prodPay + teachPay) + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + money(pay) + '</td></tr>';
+      rows += '<tr><td class="nm">' + socEsc(m) + '</td><td class="n">' + rnd(base) + '</td><td class="n">' + d3(prod + cre) + (cre ? ' <span class="mut">(тв. ' + d3(cre) + ')</span>' : '') + '</td><td class="n">' + teachCell + '</td><td class="n">' + money(prodPay + crePay + teachPay) + '</td><td class="n">' + bonusCell + '</td><td class="n pay">' + money(pay) + '</td></tr>';
       // блок детализации: формула цифрами + записи по дням
       const lines = (detBy[m] || []).map(x => {
         const dt = socIsoDate(x.work_date).slice(5).split('-').reverse().join('.');
@@ -3713,8 +3727,9 @@ app.get('/socrates/salary', async (req, res) => {
         if (isAbs) { calc = '<span class="mut">не оплачивается</span>'; }
         else if (f === null) { calc = '<span class="warn">доля не определена</span>'; }
         else {
-          const pay = f * rate * (isTeach ? SOC_TEACH_K : 1);
-          calc = d3(f) + ' × ' + money(rate) + (isTeach ? ' × ' + SOC_TEACH_K : '');
+          const rr = socIsCreative(m, x.object) ? SOC_CREATIVE.base / wd : rate;
+          const pay = f * rr * (isTeach ? SOC_TEACH_K : 1);
+          calc = d3(f) + ' × ' + money(rr) + (isTeach ? ' × ' + SOC_TEACH_K : '');
           sum = money(pay);
         }
         return '<tr' + (isAbs ? ' class="ab"' : '') + '><td class="dtd">' + dt + '</td><td>' + what + quote + '</td><td class="n calc">' + calc + '</td><td class="n">' + sum + '</td></tr>';
@@ -3722,6 +3737,7 @@ app.get('/socrates/salary', async (req, res) => {
       const formula =
         'Дневная ставка: ' + rnd(base) + ' / ' + wd + ' = <b>' + money(rate) + '</b> ₽/день<br>' +
         'Производственные дни: ' + d3(prod) + ' × ' + money(rate) + ' = <b>' + money(prodPay) + '</b> ₽' +
+        (cre ? '<br>Творческие проекты: ' + d3(cre) + ' × ' + money(rateCre) + ' = <b>' + money(crePay) + '</b> ₽' : '') +
         (teach ? '<br>Дни курса: ' + d3(teach) + ' × ' + money(rate) + ' × ' + SOC_TEACH_K + ' = <b>' + money(teachPay) + '</b> ₽' : '') +
         (a.absent ? '<br>Отсутствия (не оплачиваются): ' + d3(a.absent) + ' дн' : '') +
         (bonus ? '<br>Надбавка: <b>' + rnd(bonus) + '</b> ₽' : '') +
@@ -3745,11 +3761,11 @@ app.get('/socrates/salary', async (req, res) => {
       for (const [k, v] of map) if (t.indexOf(k) !== -1) return v;
       return 'прочее';
     };
-    const rateAt = function (mm, mth) { return salary[mm] ? salary[mm][0] / socWorkdays(mth) : 0; };
+    const rateAt = function (mm, mth, obj) { if (socIsCreative(mm, obj)) return SOC_CREATIVE.base / socWorkdays(mth); return salary[mm] ? salary[mm][0] / socWorkdays(mth) : 0; };
     const cost = {};
     let costCur = 0, costAll = 0;
     for (const r of allq.rows) {
-      const o = r.object, f = Number(r.d), rub = f * rateAt(r.master, r.mth);
+      const o = r.object, f = Number(r.d), rub = f * rateAt(r.master, r.mth, r.object);
       if (!cost[o]) cost[o] = { rub: 0, byMonth: {}, byKind: {} };
       cost[o].rub += rub;
       if (!cost[o].byMonth[r.mth]) cost[o].byMonth[r.mth] = { rub: 0, hours: 0 };
