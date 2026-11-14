@@ -6,6 +6,17 @@ class AIError extends Error {
   constructor(code, status = 502) { super(code); this.code = code; this.status = status; }
 }
 
+function romeoFormat() {
+  const nullable={type:['string','null']};
+  const properties={reply:{type:'string'},should_reply:{type:'boolean'},
+    warmth:{type:'string',enum:['cold','warm','hot']},lead_type:{type:'string',enum:['student','partner','insider','equipment']},
+    content_interest:nullable,photos_course:nullable,summary:nullable,
+    manager:{type:'string',enum:['samarina','kashinskiy']},language:{type:'string'},handoff:{type:'boolean'},phone:nullable,
+    comment_intent:{type:['string','null'],enum:['demand','praise','none',null]},email:nullable,client_name:nullable,lead_source:nullable,
+    stage_hint:{type:'string',enum:['in_dialog','hot','no_money','none']},send_route:{type:'boolean'}};
+  return {type:'json_schema',name:'romeo_reply_v1',strict:true,schema:{type:'object',additionalProperties:false,properties,required:Object.keys(properties)}};
+}
+
 function textBlocks(value) {
   if (typeof value === 'string') return value;
   if (!Array.isArray(value)) throw new AIError('INVALID_TEXT', 400);
@@ -34,13 +45,15 @@ function toResponses(body, config) {
     if (Object.keys(message).some(k => !['role', 'content'].includes(k))) throw new AIError('UNSUPPORTED_MESSAGE_OPTION', 400);
     return { role: message.role, content: textBlocks(message.content) };
   });
+  const instructions=body.system === undefined ? '' : textBlocks(body.system);
+  const isRomeo=instructions.includes('# ФОРМАТ ОТВЕТА') && instructions.includes('"should_reply"') && instructions.includes('"send_route"');
   return {
     model: config.model,
-    instructions: body.system === undefined ? '' : textBlocks(body.system),
+    instructions,
     input,
     max_output_tokens: maxTokens,
     reasoning: { effort: config.reasoningEffort },
-    text: { verbosity: 'low' },
+    text: { verbosity: 'low', ...(isRomeo ? {format:romeoFormat()} : {}) },
     store: false,
   };
 }
