@@ -146,7 +146,7 @@ async function pgGetCache(key) {
   if (!pgPool) return null;
   try {
     const result = await pgPool.query('SELECT value FROM cache WHERE key=$1', [key]);
-    return result.rows[0] ? JSON.parse(result.rows[0].value) : null;
+    return result.rows[0] ? (typeof result.rows[0].value === 'string' ? JSON.parse(result.rows[0].value) : result.rows[0].value) : null;
   } catch (err) {
     console.log('⚠️ pgGetCache error:', key, err.message);
     return null;
@@ -181,7 +181,7 @@ async function pgLoadAllIntoMemory(cache) {
       // digest-снапшоты не поднимаем: разбор всегда должен считаться заново
       if (row.key && row.key.indexOf('socrates_digest_') === 0) continue;
       try {
-        cache[row.key] = JSON.parse(row.value);
+        cache[row.key] = typeof row.value === 'string' ? JSON.parse(row.value) : row.value;
         loaded++;
       } catch (e) {}
     }
@@ -543,11 +543,12 @@ app.get('/leads-debug', async (req, res) => {
   }
 });
 
-const ROMEO_ID = 80100;
+const ROMEO_ID = 80198;
 function authorRole(authorId, managerList, owner) {
-  if (authorId === 0) return 'system';
-  if (authorId === ROMEO_ID) return 'romeo';
-  if ((Array.isArray(managerList) && managerList.indexOf(authorId) !== -1) || authorId === owner) return 'manager';
+  const id = String(authorId);
+  if (id === '0') return 'system';
+  if (['80198', '80100', '80098'].includes(id)) return 'romeo';
+  if ((Array.isArray(managerList) && managerList.some(m => String(m) === id)) || (owner != null && id === String(owner))) return 'manager';
   return 'client';
 }
 
