@@ -33,7 +33,7 @@ async function aiFetch(url, options, env = process.env, fetchImpl = globalThis.f
     const result = await generate(body, {
       model: env.OPENAI_MODEL || 'gpt-6.1-sol',
       reasoningEffort: env.OPENAI_REASONING_EFFORT || 'medium',
-      ...(env.OPENAI_MAX_OUTPUT_TOKENS ? {maxOutputTokens: Number(env.OPENAI_MAX_OUTPUT_TOKENS)} : {}),
+      ...(env.OPENAI_MAX_OUTPUT_TOKENS ? {maxOutputTokens: String(body.system||'').startsWith('SOCRATES_RECORDS_V2') ? Math.max(Number(env.OPENAI_MAX_OUTPUT_TOKENS),body.max_tokens) : Number(env.OPENAI_MAX_OUTPUT_TOKENS)} : {}),
     }, { apiKey: env.OPENAI_API_KEY, timeoutMs: options.timeout || 120000, fetchImpl });
     return { ok: true, status: 200, json: async () => result };
   } catch (error) {

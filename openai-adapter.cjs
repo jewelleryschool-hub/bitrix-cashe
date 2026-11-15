@@ -53,13 +53,13 @@ function toResponses(body, config) {
     input,
     max_output_tokens: maxTokens,
     reasoning: { effort: config.reasoningEffort },
-    text: { verbosity: 'low', ...(isRomeo ? {format:romeoFormat()} : {}) },
+    text: { verbosity: 'low', ...(isRomeo ? {format:romeoFormat()} : instructions.startsWith('SOCRATES_RECORDS_V2') ? {format:require('./socrates/parser.cjs').format()} : {}) },
     store: false,
   };
 }
 
 function fromResponses(response) {
-  if (response?.status !== 'completed') throw new AIError('AI_RESPONSE_NOT_COMPLETED');
+  if (response?.status !== 'completed') { const reason=response?.incomplete_details?.reason; throw new AIError('AI_RESPONSE_NOT_COMPLETED'+(['max_output_tokens','content_filter'].includes(reason)?'_'+reason.toUpperCase():'')); }
   const texts = [];
   for (const item of response.output || []) {
     if (item.type === 'reasoning') continue;
