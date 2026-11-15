@@ -202,6 +202,7 @@ const NL = String.fromCharCode(10);
 
 app.use(express.json({ limit: '10mb' }));
 registerLiftDelivery(app, { getPool: () => pgPool });
+require('./reply-delivery.cjs').registerReplyDelivery(app, {getPool: () => pgPool});
 
 let cache = {};
 let lastUpdate = {};
